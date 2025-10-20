@@ -1,5 +1,5 @@
 // =================================================================
-// صياد الدرر: v2.3 (تصحيح أسعار الغاز + واجهة كاملة)
+// صياد الدرر: v2.4 (تصحيح نهائي لأسعار الغاز + واجهة كاملة)
 // =================================================================
 import { ethers } from 'ethers';
 import dotenv from 'dotenv';
@@ -127,13 +127,12 @@ async function snipeToken(pairAddress, tokenAddress) {
             value: bnbAmountWei,
             gasLimit: config.GAS_LIMIT,
         };
+        const tip = ethers.parseUnits(config.GAS_PRICE_TIP_GWEI.toString(), 'gwei');
         if (feeData.maxFeePerGas && feeData.maxPriorityFeePerGas) {
-            const tip = ethers.parseUnits(config.GAS_PRICE_TIP_GWEI.toString(), 'gwei');
             txOptions.maxFeePerGas = feeData.maxFeePerGas;
-            txOptions.maxPriorityFeePerGas = feeData.maxPriorityFeePerGas.add(tip);
+            txOptions.maxPriorityFeePerGas = feeData.maxPriorityFeePerGas + tip; // <<<<<<< التصحيح
         } else {
-            const tip = ethers.parseUnits(config.GAS_PRICE_TIP_GWEI.toString(), 'gwei');
-            txOptions.gasPrice = feeData.gasPrice.add(tip);
+            txOptions.gasPrice = feeData.gasPrice + tip; // <<<<<<< التصحيح
         }
         const tx = await routerContract.swapExactETHForTokens(
             minTokens,
@@ -248,7 +247,7 @@ function removeTrade(tradeToRemove) {
 // 4. الراصد ونقطة الانطلاق (Watcher & Main)
 // =================================================================
 async function main() {
-    logger.info(`--- بدء تشغيل بوت صياد الدرر (v2.3 JS) ---`);
+    logger.info(`--- بدء تشغيل بوت صياد الدرر (v2.4 JS) ---`);
     try {
         provider = new ethers.JsonRpcProvider(config.PROTECTED_RPC_URL);
         wallet = new ethers.Wallet(config.PRIVATE_KEY, provider);
@@ -258,7 +257,7 @@ async function main() {
         const network = await provider.getNetwork();
         logger.info(`✅ تم الاتصال بالشبكة بنجاح! (${network.name}, ChainID: ${network.chainId})`);
         
-        const welcomeMsg = `✅ <b>تم تشغيل بوت صياد الدرر (v2.3 JS) بنجاح!</b>`;
+        const welcomeMsg = `✅ <b>تم تشغيل بوت صياد الدرر (v2.4 JS) بنجاح!</b>`;
         telegram.sendMessage(config.TELEGRAM_ADMIN_CHAT_ID, welcomeMsg, { parse_mode: 'HTML', reply_markup: getMainMenuKeyboard() });
 
         telegram.on('message', (msg) => {
@@ -317,7 +316,7 @@ async function main() {
                     telegram.editMessageText(`⏳ جاري بيع ${percentage}% من ${tokenAddress.slice(0,10)}...`, { chat_id: chatId, message_id: query.message.message_id });
                     executeSell(trade, amount, `بيع يدوي ${percentage}%`).then(success => {
                         if (success) {
-                            trade.remainingAmountWei = trade.remainingAmountWei.sub(amount);
+                            trade.remainingAmountWei = trade.remainingAmountWei - amount;
                             if (percentage === '100' || trade.remainingAmountWei.toString() === '0') removeTrade(trade);
                         }
                     });
@@ -435,9 +434,8 @@ function showSellPercentageMenu(chatId, messageId, tokenAddress) {
     });
 }
 
-// Prevent Telegram polling errors from crashing the bot
 telegram.on('polling_error', (error) => {
-    logger.error(`[خطأ تليجرام] ${error.message}`);
+    logger.error(`[خطأ تليجرام] ${error.code}: ${error.message}`);
 });
 
 main();
