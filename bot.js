@@ -1,5 +1,5 @@
 // =================================================================
-// صياد الدرر: v2.4 (تصحيح نهائي لأسعار الغاز + واجهة كاملة)
+// صياد الدرر: v2.5 (فحص أمني صبور + واجهة كاملة)
 // =================================================================
 import { ethers } from 'ethers';
 import dotenv from 'dotenv';
@@ -66,7 +66,11 @@ const SETTING_PROMPTS = {
 // =================================================================
 // 1. المدقق (Verifier)
 // =================================================================
-async function checkTokenSecurity(tokenAddress) {
+async function sleep(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+async function checkTokenSecurity(tokenAddress, retry = true) {
     if (!config.GOPLUS_API_KEY) {
         logger.warn("[فحص أمني] مفتاح Go+ API غير موجود، تم تخطي الفحص.");
         return { is_safe: true, reason: "فحص أمني معطل" };
@@ -75,7 +79,16 @@ async function checkTokenSecurity(tokenAddress) {
         const url = `https://api.gopluslabs.io/api/v1/token_security/56?contract_addresses=${tokenAddress}`;
         const response = await axios.get(url, { headers: { 'X-API-KEY': config.GOPLUS_API_KEY } });
         const result = response.data.result[tokenAddress.toLowerCase()];
-        if (!result) return { is_safe: false, reason: "لم يتم العثور على العملة في Go+" };
+
+        if (!result) {
+            if (retry) {
+                logger.warn(`[فحص أمني] لم يتم العثور على العملة في Go+، سأنتظر 3 ثوانٍ وأحاول مرة أخرى.`);
+                await sleep(3000); // الانتظار 3 ثوانٍ
+                return checkTokenSecurity(tokenAddress, false); // المحاولة مرة أخرى بدون إعادة محاولة
+            }
+            return { is_safe: false, reason: "لم يتم العثور على العملة في Go+" };
+        }
+
         if (result.is_honeypot === '1') return { is_safe: false, reason: "فخ عسل حسب Go+" };
         if (parseFloat(result.sell_tax) > 0.15) return { is_safe: false, reason: `ضريبة بيع مرتفعة (${(parseFloat(result.sell_tax) * 100).toFixed(0)}%)` };
         if (result.cannot_sell_all === '1') return { is_safe: false, reason: "لا يمكن بيع كل الكمية" };
@@ -130,9 +143,9 @@ async function snipeToken(pairAddress, tokenAddress) {
         const tip = ethers.parseUnits(config.GAS_PRICE_TIP_GWEI.toString(), 'gwei');
         if (feeData.maxFeePerGas && feeData.maxPriorityFeePerGas) {
             txOptions.maxFeePerGas = feeData.maxFeePerGas;
-            txOptions.maxPriorityFeePerGas = feeData.maxPriorityFeePerGas + tip; // <<<<<<< التصحيح
+            txOptions.maxPriorityFeePerGas = feeData.maxPriorityFeePerGas + tip;
         } else {
-            txOptions.gasPrice = feeData.gasPrice + tip; // <<<<<<< التصحيح
+            txOptions.gasPrice = feeData.gasPrice + tip;
         }
         const tx = await routerContract.swapExactETHForTokens(
             minTokens,
@@ -247,7 +260,7 @@ function removeTrade(tradeToRemove) {
 // 4. الراصد ونقطة الانطلاق (Watcher & Main)
 // =================================================================
 async function main() {
-    logger.info(`--- بدء تشغيل بوت صياد الدرر (v2.4 JS) ---`);
+    logger.info(`--- بدء تشغيل بوت صياد الدرر (v2.5 JS) ---`);
     try {
         provider = new ethers.JsonRpcProvider(config.PROTECTED_RPC_URL);
         wallet = new ethers.Wallet(config.PRIVATE_KEY, provider);
@@ -257,7 +270,7 @@ async function main() {
         const network = await provider.getNetwork();
         logger.info(`✅ تم الاتصال بالشبكة بنجاح! (${network.name}, ChainID: ${network.chainId})`);
         
-        const welcomeMsg = `✅ <b>تم تشغيل بوت صياد الدرر (v2.4 JS) بنجاح!</b>`;
+        const welcomeMsg = `✅ <b>تم تشغيل بوت صياد الدرر (v2.5 JS) بنجاح!</b>`;
         telegram.sendMessage(config.TELEGRAM_ADMIN_CHAT_ID, welcomeMsg, { parse_mode: 'HTML', reply_markup: getMainMenuKeyboard() });
 
         telegram.on('message', (msg) => {
