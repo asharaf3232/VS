@@ -1,0 +1,15 @@
+{
+  "name": "js-sniper-bot",
+  "version": "1.0.0",
+  "description": "High-speed sniper bot in JavaScript",
+  "main": "bot.js",
+  "scripts": {
+    "start": "node bot.js"
+  },
+  "type": "module",
+  "dependencies": {
+    "dotenv": "^16.3.1",
+    "ethers": "^6.7.1",
+    "node-telegram-bot-api": "^0.63.0"
+  }
+}
