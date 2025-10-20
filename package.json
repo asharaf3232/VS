@@ -1,13 +1,14 @@
 {
   "name": "js-sniper-bot",
-  "version": "1.2.0",
-  "description": "High-speed sniper bot in JavaScript with full UI",
+  "version": "2.2.0",
+  "description": "Professional-grade sniper bot with advanced features",
   "main": "bot.js",
   "scripts": {
     "start": "node bot.js"
   },
   "type": "module",
   "dependencies": {
+    "axios": "^1.6.2",
     "dotenv": "^16.3.1",
     "ethers": "^6.7.1",
     "node-telegram-bot-api": "^0.63.0",
