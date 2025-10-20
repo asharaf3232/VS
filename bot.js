@@ -1,6 +1,5 @@
 // =================================================================
-// صياد الدرر: v2.2 (النسخة النهائية الكاملة - BloXroute)
-// الميزات: حماية من الساندويتش، فحص أمني، وقف خسارة متحرك، بيع يدوي، رابط شارت
+// صياد الدرر: v2.3 (تصحيح أسعار الغاز + واجهة كاملة)
 // =================================================================
 import { ethers } from 'ethers';
 import dotenv from 'dotenv';
@@ -56,6 +55,13 @@ let provider, wallet, factoryContract, routerContract;
 const activeTrades = [];
 const telegram = new TelegramBot(config.TELEGRAM_BOT_TOKEN, { polling: true });
 const userState = {};
+const SETTING_PROMPTS = {
+    "BUY_AMOUNT_BNB": "يرجى إرسال مبلغ الشراء الجديد بالـ BNB (مثال: 0.01):",
+    "GAS_PRICE_TIP_GWEI": "يرجى إرسال إكرامية الغاز الجديدة بالـ Gwei (مثال: 1):",
+    "SLIPPAGE_LIMIT": "يرجى إرسال نسبة الانزلاق السعري الجديدة (مثال: 49):",
+    "MINIMUM_LIQUIDITY_BNB": "يرجى إرسال الحد الأدنى للسيولة بالـ BNB (مثال: 5.0):",
+    "TRAILING_STOP_LOSS_PERCENT": "يرجى إرسال نسبة وقف الخسارة المتحرك الجديدة (مثال: 20):",
+};
 
 // =================================================================
 // 1. المدقق (Verifier)
@@ -117,19 +123,24 @@ async function snipeToken(pairAddress, tokenAddress) {
         const amountsOut = await routerContract.getAmountsOut.staticCall(bnbAmountWei, path);
         const minTokens = amountsOut[1] * BigInt(100 - config.SLIPPAGE_LIMIT) / BigInt(100);
         const feeData = await provider.getFeeData();
-        const tip = ethers.parseUnits(config.GAS_PRICE_TIP_GWEI.toString(), 'gwei');
-        const maxPriorityFeePerGas = feeData.maxPriorityFeePerGas.add(tip);
+        const txOptions = {
+            value: bnbAmountWei,
+            gasLimit: config.GAS_LIMIT,
+        };
+        if (feeData.maxFeePerGas && feeData.maxPriorityFeePerGas) {
+            const tip = ethers.parseUnits(config.GAS_PRICE_TIP_GWEI.toString(), 'gwei');
+            txOptions.maxFeePerGas = feeData.maxFeePerGas;
+            txOptions.maxPriorityFeePerGas = feeData.maxPriorityFeePerGas.add(tip);
+        } else {
+            const tip = ethers.parseUnits(config.GAS_PRICE_TIP_GWEI.toString(), 'gwei');
+            txOptions.gasPrice = feeData.gasPrice.add(tip);
+        }
         const tx = await routerContract.swapExactETHForTokens(
             minTokens,
             path,
             config.WALLET_ADDRESS,
             Math.floor(Date.now() / 1000) + 120,
-            {
-                value: bnbAmountWei,
-                gasLimit: config.GAS_LIMIT,
-                maxFeePerGas: feeData.maxFeePerGas,
-                maxPriorityFeePerGas: maxPriorityFeePerGas
-            }
+            txOptions
         );
         logger.info(`[شراء] تم إرسال المعاملة المحمية. الهاش: ${tx.hash}`);
         const receipt = await tx.wait();
@@ -155,7 +166,14 @@ async function approveMax(tokenAddress) {
         logger.info(`[موافقة] جاري عمل Approve لـ ${tokenAddress}...`);
         const tokenContract = new ethers.Contract(tokenAddress, ERC20_ABI, wallet);
         const feeData = await provider.getFeeData();
-        const tx = await tokenContract.approve(config.ROUTER_ADDRESS, ethers.MaxUint256, { maxFeePerGas: feeData.maxFeePerGas, maxPriorityFeePerGas: feeData.maxPriorityFeePerGas });
+        const txOptions = {};
+        if (feeData.maxFeePerGas && feeData.maxPriorityFeePerGas) {
+             txOptions.maxFeePerGas = feeData.maxFeePerGas;
+             txOptions.maxPriorityFeePerGas = feeData.maxPriorityFeePerGas;
+        } else {
+            txOptions.gasPrice = feeData.gasPrice;
+        }
+        const tx = await tokenContract.approve(config.ROUTER_ADDRESS, ethers.MaxUint256, txOptions);
         await tx.wait();
         logger.info(`[موافقة] ✅ تمت الموافقة بنجاح لـ ${tokenAddress}`);
     } catch (error) {
@@ -178,7 +196,7 @@ async function monitorTrades() {
             trade.currentProfit = profit;
             trade.highestProfit = Math.max(trade.highestProfit, profit);
             logger.info(`[مراقبة] ${trade.tokenAddress.slice(0, 10)}... | الربح الحالي: ${profit.toFixed(2)}% | أعلى ربح: ${trade.highestProfit.toFixed(2)}%`);
-            if (profit < trade.highestProfit - config.TRAILING_STOP_LOSS_PERCENT) {
+            if (profit > 0 && profit < trade.highestProfit - config.TRAILING_STOP_LOSS_PERCENT) {
                 logger.info(`🎯 [الحارس] تفعيل وقف الخسارة المتحرك لـ ${trade.tokenAddress} عند ربح ${profit.toFixed(2)}%`);
                 executeSell(trade, trade.remainingAmountWei, `وقف خسارة متحرك`).then(success => { if (success) removeTrade(trade); });
             }
@@ -194,9 +212,16 @@ async function executeSell(trade, amountToSellWei, reason = "يدوي") {
         logger.info(`💸 [بيع] بدء عملية بيع ${reason} لـ ${trade.tokenAddress}...`);
         const path = [trade.tokenAddress, config.WBNB_ADDRESS];
         const feeData = await provider.getFeeData();
+        const txOptions = { gasLimit: config.GAS_LIMIT };
+        if (feeData.maxFeePerGas && feeData.maxPriorityFeePerGas) {
+             txOptions.maxFeePerGas = feeData.maxFeePerGas;
+             txOptions.maxPriorityFeePerGas = feeData.maxPriorityFeePerGas;
+        } else {
+            txOptions.gasPrice = feeData.gasPrice;
+        }
         const tx = await routerContract.swapExactTokensForETHSupportingFeeOnTransferTokens(
             amountToSellWei, 0, path, config.WALLET_ADDRESS, Math.floor(Date.now() / 1000) + 300,
-            { gasLimit: config.GAS_LIMIT, maxFeePerGas: feeData.maxFeePerGas, maxPriorityFeePerGas: feeData.maxPriorityFeePerGas }
+            txOptions
         );
         const receipt = await tx.wait();
         if (receipt.status === 1) {
@@ -223,7 +248,7 @@ function removeTrade(tradeToRemove) {
 // 4. الراصد ونقطة الانطلاق (Watcher & Main)
 // =================================================================
 async function main() {
-    logger.info(`--- بدء تشغيل بوت صياد الدرر (v2.2 JS) ---`);
+    logger.info(`--- بدء تشغيل بوت صياد الدرر (v2.3 JS) ---`);
     try {
         provider = new ethers.JsonRpcProvider(config.PROTECTED_RPC_URL);
         wallet = new ethers.Wallet(config.PRIVATE_KEY, provider);
@@ -233,7 +258,7 @@ async function main() {
         const network = await provider.getNetwork();
         logger.info(`✅ تم الاتصال بالشبكة بنجاح! (${network.name}, ChainID: ${network.chainId})`);
         
-        const welcomeMsg = `✅ <b>تم تشغيل بوت صياد الدرر (v2.2 JS) بنجاح!</b>`;
+        const welcomeMsg = `✅ <b>تم تشغيل بوت صياد الدرر (v2.3 JS) بنجاح!</b>`;
         telegram.sendMessage(config.TELEGRAM_ADMIN_CHAT_ID, welcomeMsg, { parse_mode: 'HTML', reply_markup: getMainMenuKeyboard() });
 
         telegram.on('message', (msg) => {
@@ -293,7 +318,7 @@ async function main() {
                     executeSell(trade, amount, `بيع يدوي ${percentage}%`).then(success => {
                         if (success) {
                             trade.remainingAmountWei = trade.remainingAmountWei.sub(amount);
-                            if (percentage === '100') removeTrade(trade);
+                            if (percentage === '100' || trade.remainingAmountWei.toString() === '0') removeTrade(trade);
                         }
                     });
                 }
@@ -409,5 +434,10 @@ function showSellPercentageMenu(chatId, messageId, tokenAddress) {
         reply_markup: { inline_keyboard: keyboard }
     });
 }
+
+// Prevent Telegram polling errors from crashing the bot
+telegram.on('polling_error', (error) => {
+    logger.error(`[خطأ تليجرام] ${error.message}`);
+});
 
 main();
