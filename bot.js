@@ -445,7 +445,7 @@ async function fetchTrendingPairs() {
     
     try {
         const query = 'age:h1 age:h6 liquidity:50000 txns:h1:50 vol:h1:20000 chain:bsc';
-        const url = `https://api.dexscreener.com/api/v2/pairs/search?q=${query}`;
+        const url = `https://api.dexscreener.com/latest/dex/search?q=${query}`;
 
         
         logger.info("[راصد الزخم] جاري البحث عن أهداف جديدة...");
