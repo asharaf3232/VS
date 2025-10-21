@@ -1,5 +1,5 @@
 // =================================================================
-// صياد الدرر: v2.5 (فحص أمني صبور + واجهة كاملة)
+// صياد الدرر: v2.6 (فحص أمني صبور + إعادة اتصال + تخزين + واجهة كاملة)
 // =================================================================
 import { ethers } from 'ethers';
 import dotenv from 'dotenv';
@@ -51,10 +51,11 @@ const ROUTER_ABI = ['function getAmountsOut(uint amountIn, address[] memory path
 const ERC20_ABI = ['function decimals() view returns (uint8)', 'function approve(address spender, uint256 amount) external returns (bool)', 'function balanceOf(address account) external view returns (uint256)'];
 
 // --- تهيئة المتغيرات الرئيسية ---
-let provider, wallet, factoryContract, routerContract;
+let provider, wallet, factoryContract, routerContract, wssProvider;
 const activeTrades = [];
 const telegram = new TelegramBot(config.TELEGRAM_BOT_TOKEN, { polling: true });
 const userState = {};
+const TRADES_FILE = 'active_trades.json';
 const SETTING_PROMPTS = {
     "BUY_AMOUNT_BNB": "يرجى إرسال مبلغ الشراء الجديد بالـ BNB (مثال: 0.01):",
     "GAS_PRICE_TIP_GWEI": "يرجى إرسال إكرامية الغاز الجديدة بالـ Gwei (مثال: 1):",
@@ -83,8 +84,8 @@ async function checkTokenSecurity(tokenAddress, retry = true) {
         if (!result) {
             if (retry) {
                 logger.warn(`[فحص أمني] لم يتم العثور على العملة في Go+، سأنتظر 3 ثوانٍ وأحاول مرة أخرى.`);
-                await sleep(3000); // الانتظار 3 ثوانٍ
-                return checkTokenSecurity(tokenAddress, false); // المحاولة مرة أخرى بدون إعادة محاولة
+                await sleep(3000);
+                return checkTokenSecurity(tokenAddress, false);
             }
             return { is_safe: false, reason: "لم يتم العثور على العملة في Go+" };
         }
@@ -103,7 +104,7 @@ async function checkTokenSecurity(tokenAddress, retry = true) {
 async function fullCheck(pairAddress, tokenAddress) {
     try {
         logger.info(`[فحص] بدء الفحص الشامل لـ ${tokenAddress}`);
-        const pairContract = new ethers.Contract(pairAddress, PAIR_ABI, provider);
+        const pairContract = new ethers.Contract(pairAddress, PAIR_ABI, provider); // Use the main provider for checks
         const reserves = await pairContract.getReserves();
         const token0 = await pairContract.token0();
         const wbnbReserve = token0.toLowerCase() === config.WBNB_ADDRESS.toLowerCase() ? reserves[0] : reserves[1];
@@ -116,6 +117,7 @@ async function fullCheck(pairAddress, tokenAddress) {
         if (!securityResult.is_safe) {
             return { passed: false, reason: securityResult.reason };
         }
+        // Use staticCall with the wallet's provider (which includes the signer)
         await routerContract.getAmountsOut.staticCall(ethers.parseUnits("1", 0), [tokenAddress, config.WBNB_ADDRESS]);
         logger.info(`[فحص] ✅ نجحت محاكاة البيع. العملة قابلة للبيع.`);
         return { passed: true, reason: "اجتاز كل الفحوصات" };
@@ -164,6 +166,7 @@ async function snipeToken(pairAddress, tokenAddress) {
             const msg = `💰 <b>نجحت عملية الشراء!</b> 💰\n\n<b>العملة:</b> <code>${tokenAddress}</code>\n<b>رابط المعاملة:</b> <a href='https://bscscan.com/tx/${tx.hash}'>BscScan</a>\n<b>📊 رابط الشارت:</b> <a href='https://dexscreener.com/bsc/${pairAddress}'>DexScreener</a>`;
             telegram.sendMessage(config.TELEGRAM_ADMIN_CHAT_ID, msg, { parse_mode: 'HTML' });
             activeTrades.push({ tokenAddress, pairAddress, buyPrice, initialAmountWei: amountsOut[1], remainingAmountWei: amountsOut[1], decimals, currentProfit: 0, highestProfit: 0 });
+            saveTradesToFile(); // حفظ الصفقة الجديدة
             approveMax(tokenAddress);
         } else {
             logger.error(`🚨 فشلت معاملة الشراء (الحالة 0).`);
@@ -198,30 +201,45 @@ async function approveMax(tokenAddress) {
 // =================================================================
 async function monitorTrades() {
     if (activeTrades.length === 0) return;
-    for (const trade of [...activeTrades]) {
+    for (const trade of [...activeTrades]) { // Use spread operator to iterate over a copy
         try {
             const path = [trade.tokenAddress, config.WBNB_ADDRESS];
             const oneToken = ethers.parseUnits("1", trade.decimals);
+            // Use staticCall with the wallet provider for consistency
             const amountsOut = await routerContract.getAmountsOut.staticCall(oneToken, path);
-            const currentPrice = parseFloat(ethers.formatUnits(amountsOut[1], 18));
+            const currentPrice = parseFloat(ethers.formatUnits(amountsOut[1], 18)); // WBNB has 18 decimals
             const profit = trade.buyPrice > 0 ? ((currentPrice - trade.buyPrice) / trade.buyPrice) * 100 : 0;
             trade.currentProfit = profit;
             trade.highestProfit = Math.max(trade.highestProfit, profit);
             logger.info(`[مراقبة] ${trade.tokenAddress.slice(0, 10)}... | الربح الحالي: ${profit.toFixed(2)}% | أعلى ربح: ${trade.highestProfit.toFixed(2)}%`);
-            if (profit > 0 && profit < trade.highestProfit - config.TRAILING_STOP_LOSS_PERCENT) {
+            // Only trigger trailing stop loss if profit was positive at some point
+            if (trade.highestProfit > 0 && profit < trade.highestProfit - config.TRAILING_STOP_LOSS_PERCENT) {
                 logger.info(`🎯 [الحارس] تفعيل وقف الخسارة المتحرك لـ ${trade.tokenAddress} عند ربح ${profit.toFixed(2)}%`);
-                executeSell(trade, trade.remainingAmountWei, `وقف خسارة متحرك`).then(success => { if (success) removeTrade(trade); });
+                // Use await here to ensure sell finishes before potential removal
+                const success = await executeSell(trade, trade.remainingAmountWei, `وقف خسارة متحرك`);
+                if (success) {
+                    removeTrade(trade); // removeTrade now handles saving
+                }
             }
         } catch (error) {
-            logger.error(`[مراقبة] خطأ في مراقبة ${trade.tokenAddress}: ${error}`);
+            // Check if the error indicates the trade might already be closed or invalid
+            if (error.code === 'CALL_EXCEPTION') {
+                 logger.warn(`[مراقبة] قد تكون الصفقة ${trade.tokenAddress} مغلقة أو غير صالحة. خطأ: ${error.reason}`);
+                 // Optionally remove the trade here if errors persist
+            } else {
+                 logger.error(`[مراقبة] خطأ في مراقبة ${trade.tokenAddress}: ${error}`);
+            }
         }
     }
 }
 
 async function executeSell(trade, amountToSellWei, reason = "يدوي") {
-    if (amountToSellWei.toString() === '0') return false;
+    if (amountToSellWei.toString() === '0') {
+         logger.warn(`[بيع] محاولة بيع كمية صفر من ${trade.tokenAddress}`);
+         return false; // Cannot sell zero amount
+    }
     try {
-        logger.info(`💸 [بيع] بدء عملية بيع ${reason} لـ ${trade.tokenAddress}...`);
+        logger.info(`💸 [بيع] بدء عملية بيع ${reason} لـ ${trade.tokenAddress}... الكمية: ${ethers.formatUnits(amountToSellWei, trade.decimals)}`);
         const path = [trade.tokenAddress, config.WBNB_ADDRESS];
         const feeData = await provider.getFeeData();
         const txOptions = { gasLimit: config.GAS_LIMIT };
@@ -235,42 +253,137 @@ async function executeSell(trade, amountToSellWei, reason = "يدوي") {
             amountToSellWei, 0, path, config.WALLET_ADDRESS, Math.floor(Date.now() / 1000) + 300,
             txOptions
         );
+        logger.info(`[بيع] تم إرسال معاملة البيع (${reason}). الهاش: ${tx.hash}`);
         const receipt = await tx.wait();
         if (receipt.status === 1) {
             const msg = `💸 <b>نجحت عملية البيع (${reason})!</b> 💸\n\n<b>العملة:</b> <code>${trade.tokenAddress}</code>\n<b>رابط المعاملة:</b> <a href='https://bscscan.com/tx/${tx.hash}'>BscScan</a>`;
             telegram.sendMessage(config.TELEGRAM_ADMIN_CHAT_ID, msg, { parse_mode: 'HTML' });
             logger.info(`💰💰💰 نجحت عملية البيع لـ ${trade.tokenAddress}!`);
             return true;
+        } else {
+             logger.error(`🚨 فشلت معاملة البيع ${trade.tokenAddress} (الحالة 0).`);
         }
     } catch (error) {
-        logger.error(`❌ خطأ فادح في عملية البيع: ${error.reason || error}`);
+        logger.error(`❌ خطأ فادح في عملية البيع لـ ${trade.tokenAddress}: ${error.reason || error}`);
     }
     return false;
 }
 
+// =================================================================
+// 5. تخزين الصفقات النشطة (Persistence)
+// =================================================================
+function replacer(key, value) {
+  if (typeof value === 'bigint') { return value.toString(); }
+  return value;
+}
+function reviver(key, value) {
+  if (key.endsWith('Wei') && typeof value === 'string') { try { return BigInt(value); } catch(e) {} }
+  return value;
+}
+function saveTradesToFile() {
+    try {
+        const dataToSave = JSON.stringify(activeTrades, replacer, 2);
+        fs.writeFileSync(TRADES_FILE, dataToSave, 'utf8');
+        logger.info(`💾 تم حفظ ${activeTrades.length} صفقة نشطة في الملف.`);
+    } catch (error) {
+        logger.error(`💾 خطأ أثناء حفظ الصفقات: ${error.message}`);
+    }
+}
+function loadTradesFromFile() {
+    try {
+        if (fs.existsSync(TRADES_FILE)) {
+            const data = fs.readFileSync(TRADES_FILE, 'utf8');
+            const loadedTrades = JSON.parse(data, reviver);
+            if (Array.isArray(loadedTrades)) {
+                 activeTrades.push(...loadedTrades.filter(t => t.tokenAddress && t.remainingAmountWei));
+            }
+        } else {
+             logger.info("💾 ملف الصفقات النشطة غير موجود، البدء بقائمة فارغة.");
+        }
+    } catch (error) {
+        logger.error(`💾 خطأ أثناء تحميل الصفقات: ${error.message}`);
+        activeTrades.length = 0;
+    }
+}
 function removeTrade(tradeToRemove) {
     const index = activeTrades.findIndex(t => t.tokenAddress === tradeToRemove.tokenAddress);
     if (index > -1) {
         activeTrades.splice(index, 1);
         logger.info(`🗑️ تمت إزالة ${tradeToRemove.tokenAddress} من قائمة المراقبة.`);
+        saveTradesToFile(); // حفظ التغييرات بعد الحذف
     }
 }
 
 // =================================================================
-// 4. الراصد ونقطة الانطلاق (Watcher & Main)
+// 6. الراصد ونقطة الانطلاق (Watcher & Main)
 // =================================================================
+async function connectAndWatch() {
+    let reconnectDelay = 5000;
+    const maxDelay = 300000;
+    while (true) {
+        let heartbeatInterval;
+        try {
+            logger.info("🔌 [الراصد] محاولة الاتصال بـ WebSocket...");
+            wssProvider = new ethers.WebSocketProvider(config.NODE_URL);
+            await Promise.race([
+                wssProvider.ready,
+                sleep(30000).then(() => Promise.reject(new Error("WebSocket connection timeout")))
+            ]);
+            logger.info("✅ [الراصد] تم الاتصال بـ WebSocket بنجاح!");
+            reconnectDelay = 5000;
+            factoryContract = new ethers.Contract(config.FACTORY_ADDRESS, FACTORY_ABI, wssProvider);
+            logger.info("🎧 [الراصد] بدء الاستماع لحدث PairCreated...");
+            factoryContract.removeAllListeners('PairCreated');
+            factoryContract.on('PairCreated', handlePairCreated);
+            heartbeatInterval = setInterval(async () => {
+                try { await wssProvider.getBlockNumber(); } catch (heartbeatError) {
+                    logger.error("💔 [الراصد] فشل نبضة WebSocket! بدء إعادة الاتصال...", heartbeatError);
+                    clearInterval(heartbeatInterval);
+                    wssProvider.websocket.close();
+                }
+            }, 60000);
+            await new Promise((resolve) => {
+                wssProvider.websocket.onclose = () => { logger.warn("🔌 [الراصد] انقطع اتصال WebSocket!"); clearInterval(heartbeatInterval); resolve(); };
+                wssProvider.websocket.onerror = (err) => { logger.error("🔌 [الراصد] خطأ في WebSocket!", err); clearInterval(heartbeatInterval); };
+            });
+        } catch (error) {
+            logger.error(`🔌 [الراصد] فشل الاتصال أو خطأ فادح: ${error.message}. المحاولة مرة أخرى بعد ${reconnectDelay / 1000} ثانية...`);
+            if (wssProvider && wssProvider.websocket) { wssProvider.websocket.terminate(); }
+            if (heartbeatInterval) clearInterval(heartbeatInterval); // Clear interval on outer error too
+        }
+        await sleep(reconnectDelay);
+        reconnectDelay = Math.min(reconnectDelay * 2, maxDelay);
+    }
+}
+
+async function handlePairCreated(token0, token1, pairAddress) {
+     if (config.IS_PAUSED) return;
+     logger.info(`\n👀 [الراصد] تم رصد مجمع جديد: ${pairAddress}`);
+     const targetToken = token0.toLowerCase() === config.WBNB_ADDRESS.toLowerCase() ? token1 : token0;
+     if (targetToken.toLowerCase() === config.WBNB_ADDRESS.toLowerCase()) return;
+     const checkResult = await fullCheck(pairAddress, targetToken);
+     if (checkResult.passed) {
+         await telegram.sendMessage(config.TELEGRAM_ADMIN_CHAT_ID, `✅ <b>عملة اجتازت الفحص!</b>\n\n<code>${targetToken}</code>\n\n🚀 جاري محاولة القنص...`, { parse_mode: 'HTML' });
+         snipeToken(pairAddress, targetToken);
+     } else {
+         logger.warn(`🔻 [مهمة منتهية] تم تجاهل ${targetToken} (السبب: ${checkResult.reason}).`);
+         if (config.DEBUG_MODE) {
+             await telegram.sendMessage(config.TELEGRAM_ADMIN_CHAT_ID, `⚪️ <b>تم تجاهل عملة</b>\n\n<code>${targetToken}</code>\n\n<b>السبب:</b> ${checkResult.reason}`, { parse_mode: 'HTML' });
+         }
+     }
+}
+
 async function main() {
-    logger.info(`--- بدء تشغيل بوت صياد الدرر (v2.5 JS) ---`);
+    logger.info(`--- بدء تشغيل بوت صياد الدرر (v2.6 JS) ---`);
     try {
         provider = new ethers.JsonRpcProvider(config.PROTECTED_RPC_URL);
         wallet = new ethers.Wallet(config.PRIVATE_KEY, provider);
-        const wssProvider = new ethers.WebSocketProvider(config.NODE_URL);
-        factoryContract = new ethers.Contract(config.FACTORY_ADDRESS, FACTORY_ABI, wssProvider);
         routerContract = new ethers.Contract(config.ROUTER_ADDRESS, ROUTER_ABI, wallet);
+        loadTradesFromFile();
+        logger.info(`💾 تم تحميل ${activeTrades.length} صفقة نشطة من الملف.`);
         const network = await provider.getNetwork();
-        logger.info(`✅ تم الاتصال بالشبكة بنجاح! (${network.name}, ChainID: ${network.chainId})`);
-        
-        const welcomeMsg = `✅ <b>تم تشغيل بوت صياد الدرر (v2.5 JS) بنجاح!</b>`;
+        logger.info(`✅ تم الاتصال بالشبكة (RPC) بنجاح! (${network.name}, ChainID: ${network.chainId})`);
+        const welcomeMsg = `✅ <b>تم تشغيل بوت صياد الدرر (v2.6 JS) بنجاح!</b>`;
         telegram.sendMessage(config.TELEGRAM_ADMIN_CHAT_ID, welcomeMsg, { parse_mode: 'HTML', reply_markup: getMainMenuKeyboard() });
 
         telegram.on('message', (msg) => {
@@ -281,15 +394,15 @@ async function main() {
                 const newValueStr = msg.text;
                 try {
                     let newValue;
-                    if (['BUY_AMOUNT_BNB', 'MINIMUM_LIQUIDITY_BNB'].includes(settingKey)) { newValue = parseFloat(newValueStr); } 
-                    else if (settingKey === 'GAS_PRICE_TIP_GWEI') { newValue = BigInt(newValueStr); } 
+                    if (['BUY_AMOUNT_BNB', 'MINIMUM_LIQUIDITY_BNB'].includes(settingKey)) { newValue = parseFloat(newValueStr); }
+                    else if (settingKey === 'GAS_PRICE_TIP_GWEI') { newValue = BigInt(newValueStr); }
                     else { newValue = parseInt(newValueStr, 10); }
-                    if (isNaN(newValue) && typeof newValue !== 'bigint') throw new Error("قيمة غير صالحة");
+                    if ((isNaN(newValue) && typeof newValue !== 'bigint') || newValue < 0) throw new Error("قيمة غير صالحة");
                     config[settingKey] = newValue;
                     logger.info(`⚙️ تم تغيير ${settingKey} ديناميكياً إلى ${newValue}.`);
                     telegram.sendMessage(chatId, `✅ تم تحديث <b>${settingKey}</b> إلى: <code>${newValue.toString()}</code>`, { parse_mode: 'HTML', reply_markup: getMainMenuKeyboard() });
                 } catch (error) {
-                    telegram.sendMessage(chatId, "❌ قيمة غير صالحة. يرجى إدخال رقم صحيح.", { reply_markup: getMainMenuKeyboard() });
+                    telegram.sendMessage(chatId, "❌ قيمة غير صالحة. يرجى إدخال رقم موجب صحيح.", { reply_markup: getMainMenuKeyboard() });
                 } finally {
                     delete userState[chatId];
                 }
@@ -316,8 +429,12 @@ async function main() {
             const data = query.data;
             if (data.startsWith('change_')) {
                 const settingKey = data.replace('change_', '');
-                userState[chatId] = { awaiting: settingKey };
-                telegram.editMessageText(SETTING_PROMPTS[settingKey], { chat_id: chatId, message_id: query.message.message_id });
+                if (SETTING_PROMPTS[settingKey]) { // Ensure setting is valid
+                     userState[chatId] = { awaiting: settingKey };
+                     telegram.editMessageText(SETTING_PROMPTS[settingKey], { chat_id: chatId, message_id: query.message.message_id });
+                } else {
+                     telegram.answerCallbackQuery(query.id, { text: "إعداد غير معروف!" });
+                }
             } else if (data.startsWith('manual_sell_')) {
                 const tokenAddress = data.replace('manual_sell_', '');
                 showSellPercentageMenu(chatId, query.message.message_id, tokenAddress);
@@ -327,33 +444,33 @@ async function main() {
                 if (trade) {
                     const amount = (trade.remainingAmountWei * BigInt(percentage)) / BigInt(100);
                     telegram.editMessageText(`⏳ جاري بيع ${percentage}% من ${tokenAddress.slice(0,10)}...`, { chat_id: chatId, message_id: query.message.message_id });
+                    // Use await for executeSell and then check remaining amount
                     executeSell(trade, amount, `بيع يدوي ${percentage}%`).then(success => {
                         if (success) {
+                            // Update remaining amount *after* successful sell
                             trade.remainingAmountWei = trade.remainingAmountWei - amount;
-                            if (percentage === '100' || trade.remainingAmountWei.toString() === '0') removeTrade(trade);
+                            saveTradesToFile(); // Save updated remaining amount
+
+                            if (percentage === '100' || trade.remainingAmountWei <= 0n) { // Use <= 0n for BigInt comparison
+                                removeTrade(trade); // removeTrade handles saving after removal
+                            }
+                        } else {
+                             // Inform user if sell failed
+                             telegram.sendMessage(chatId, `❌ فشلت محاولة بيع ${percentage}% من ${tokenAddress.slice(0,10)}.`);
                         }
                     });
+                } else {
+                     telegram.answerCallbackQuery(query.id, { text: "الصفقة لم تعد موجودة!" });
                 }
             }
         });
         
-        logger.info("🎧 [الراصد] بدء الاستماع لحدث PairCreated...");
-        factoryContract.on('PairCreated', async (token0, token1, pairAddress) => {
-            if (config.IS_PAUSED) return;
-            logger.info(`\n👀 [الراصد] تم رصد مجمع جديد: ${pairAddress}`);
-            const targetToken = token0.toLowerCase() === config.WBNB_ADDRESS.toLowerCase() ? token1 : token0;
-            const checkResult = await fullCheck(pairAddress, targetToken);
-            if (checkResult.passed) {
-                await telegram.sendMessage(config.TELEGRAM_ADMIN_CHAT_ID, `✅ <b>عملة اجتازت الفحص!</b>\n\n<code>${targetToken}</code>\n\n🚀 جاري محاولة القنص...`, { parse_mode: 'HTML' });
-                snipeToken(pairAddress, targetToken);
-            } else {
-                logger.warn(`🔻 [مهمة منتهية] تم تجاهل ${targetToken} (السبب: ${checkResult.reason}).`);
-                if (config.DEBUG_MODE) {
-                    await telegram.sendMessage(config.TELEGRAM_ADMIN_CHAT_ID, `⚪️ <b>تم تجاهل عملة</b>\n\n<code>${targetToken}</code>\n\n<b>السبب:</b> ${checkResult.reason}`, { parse_mode: 'HTML' });
-                }
-            }
-        });
-        setInterval(monitorTrades, 10000);
+        // Start the watcher loop (handles its own connection/reconnection)
+        connectAndWatch();
+
+        // Start the guardian loop (monitors trades)
+        setInterval(monitorTrades, 10000); // Check every 10 seconds
+
     } catch (error) {
         logger.error(`❌ فشل فادح في الدالة الرئيسية: ${error}`);
         process.exit(1);
@@ -391,13 +508,16 @@ function showStatus(chatId) {
     statusText += "<b>⚙️ إعدادات التداول:</b>\n";
     statusText += `- مبلغ الشراء: ${config.BUY_AMOUNT_BNB} BNB\n`;
     statusText += `- وقف الخسارة المتحرك: ${config.TRAILING_STOP_LOSS_PERCENT}%\n`;
+    statusText += `- إكرامية الغاز: ${config.GAS_PRICE_TIP_GWEI} Gwei\n`;
+    statusText += `- الانزلاق السعري: ${config.SLIPPAGE_LIMIT}%\n`;
+    statusText += `- حد السيولة: ${config.MINIMUM_LIQUIDITY_BNB} BNB\n`;
     telegram.sendMessage(chatId, statusText, { parse_mode: 'HTML', reply_markup: getMainMenuKeyboard() });
 }
 
 function showDiagnostics(chatId) {
     fs.readFile('sniper_bot_pro.log', 'utf8', (err, data) => {
         let logData;
-        if (err) { logData = "ملف السجل لم يتم إنشاؤه بعد."; } 
+        if (err) { logData = "ملف السجل لم يتم إنشاؤه بعد."; }
         else {
             const lines = data.trim().split('\n');
             logData = lines.slice(-20).join('\n');
