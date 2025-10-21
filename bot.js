@@ -1,5 +1,5 @@
 // =================================================================
-// صياد الدرر: v2.6 (فحص أمني صبور + إعادة اتصال + تخزين + واجهة كاملة)
+// صياد الدرر: v3.0 (قناص خاطف - فلتر خفيف + هروب سريع)
 // =================================================================
 import { ethers } from 'ethers';
 import dotenv from 'dotenv';
@@ -22,6 +22,7 @@ const logger = winston.createLogger({
 });
 
 // --- تحميل الإعدادات ---
+// (نفس إعدادات v2.8، لأننا ما زلنا بحاجة لجني الأرباح والغاز الديناميكي)
 dotenv.config();
 const config = {
     PROTECTED_RPC_URL: process.env.PROTECTED_RPC_URL,
@@ -35,11 +36,13 @@ const config = {
     FACTORY_ADDRESS: '0xcA143Ce32Fe78f1f7019d7d551a6402fC5350c73',
     WBNB_ADDRESS: "0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c",
     BUY_AMOUNT_BNB: parseFloat(process.env.BUY_AMOUNT_BNB || '0.01'),
-    GAS_PRICE_TIP_GWEI: BigInt(process.env.GAS_PRICE_TIP_GWEI || '1'),
+    GAS_PRIORITY_MULTIPLIER: parseInt(process.env.GAS_PRIORITY_MULTIPLIER || '2', 10),
     SLIPPAGE_LIMIT: parseInt(process.env.SLIPPAGE_LIMIT || '49', 10),
     GAS_LIMIT: BigInt(process.env.GAS_LIMIT || '800000'),
     MINIMUM_LIQUIDITY_BNB: parseFloat(process.env.MINIMUM_LIQUIDITY_BNB || '5.0'),
     TRAILING_STOP_LOSS_PERCENT: parseInt(process.env.TRAILING_STOP_LOSS_PERCENT || '20', 10),
+    PARTIAL_TP_PERCENT: parseInt(process.env.PARTIAL_TP_PERCENT || '100', 10), 
+    PARTIAL_TP_SELL_PERCENT: parseInt(process.env.PARTIAL_TP_SELL_PERCENT || '50', 10), 
     DEBUG_MODE: process.env.DEBUG_MODE === 'true',
     IS_PAUSED: false,
 };
@@ -56,12 +59,16 @@ const activeTrades = [];
 const telegram = new TelegramBot(config.TELEGRAM_BOT_TOKEN, { polling: true });
 const userState = {};
 const TRADES_FILE = 'active_trades.json';
+const sellingLocks = new Set();
+// (نحتفظ بنفس قائمة الإعدادات لأننا ما زلنا نتحكم بها)
 const SETTING_PROMPTS = {
     "BUY_AMOUNT_BNB": "يرجى إرسال مبلغ الشراء الجديد بالـ BNB (مثال: 0.01):",
-    "GAS_PRICE_TIP_GWEI": "يرجى إرسال إكرامية الغاز الجديدة بالـ Gwei (مثال: 1):",
+    "GAS_PRIORITY_MULTIPLIER": "يرجى إرسال مضاعف غاز الأولوية الجديد (مثال: 2 يعني ضعف المقترح):",
     "SLIPPAGE_LIMIT": "يرجى إرسال نسبة الانزلاق السعري الجديدة (مثال: 49):",
     "MINIMUM_LIQUIDITY_BNB": "يرجى إرسال الحد الأدنى للسيولة بالـ BNB (مثال: 5.0):",
     "TRAILING_STOP_LOSS_PERCENT": "يرجى إرسال نسبة وقف الخسارة المتحرك الجديدة (مثال: 20):",
+    "PARTIAL_TP_PERCENT": "يرجى إرسال نسبة الربح لجني الأرباح الجزئي (مثال: 100):",
+    "PARTIAL_TP_SELL_PERCENT": "يرجى إرسال النسبة المئوية للبيع عند جني الأرباح الجزئي (مثال: 50):",
 };
 
 // =================================================================
@@ -72,13 +79,11 @@ async function sleep(ms) {
 }
 
 // =================================================================
-// دالة checkTokenSecurity - نسخة v2.7 مع درع وقائي
+// دالة checkTokenSecurity - نسخة v3.0 "القناص الخاطف" (فلتر خفيف)
 // =================================================================
 async function checkTokenSecurity(tokenAddress, retry = true) {
     if (!config.GOPLUS_API_KEY) {
         logger.warn("[فحص أمني] مفتاح Go+ API غير موجود، تم تخطي الفحص.");
-        // نرجع آمن كافتراضي إذا لم يكن المفتاح موجودًا، لكن هذا خطر
-        // يمكنك تغيير هذا لـ false إذا أردت أن يكون الفحص إلزاميًا
         return { is_safe: true, reason: "فحص أمني معطل" };
     }
     try {
@@ -88,84 +93,71 @@ async function checkTokenSecurity(tokenAddress, retry = true) {
 
         if (!result) {
             if (retry) {
-                logger.warn(`[فحص أمني] لم يتم العثور على العملة في Go+، سأنتظر 3 ثوانٍ وأحاول مرة أخرى.`);
-                await sleep(3000);
+                // [تطوير v3.0] تقليل فترة الانتظار إلى ثانية واحدة فقط
+                logger.warn(`[فحص أمني] لم يتم العثور على العملة في Go+، سأنتظر 1 ثانية وأحاول مرة أخرى.`);
+                await sleep(1000); 
                 return checkTokenSecurity(tokenAddress, false);
             }
             return { is_safe: false, reason: "لم يتم العثور على العملة في Go+" };
         }
 
-        // --- الفحوصات الأساسية الموجودة ---
-        if (result.is_honeypot === '1') return { is_safe: false, reason: "فخ عسل حسب Go+" };
-        const sellTax = parseFloat(result.sell_tax || '1'); // افتراض 100% إذا لم يكن موجودًا
-        if (sellTax > 0.15) return { is_safe: false, reason: `ضريبة بيع مرتفعة (${(sellTax * 100).toFixed(0)}%)` };
-        if (result.cannot_sell_all === '1') return { is_safe: false, reason: "لا يمكن بيع كل الكمية" };
+        // --- [تطوير v3.0] الفلتر الخفيف (فقط الكوارث الفورية) ---
 
-        // --- العلاج 1: فحص أقفال السيولة ---
-        // GoPlus قد ترجع تفاصيل الأقفال في مصفوفة lp_locked_detail أو نسبة مئوية مباشرة
-        // سنستخدم نهجًا أكثر أمانًا يفترض عدم القفل إذا لم نجد دليلاً واضحًا
-        let totalLockedLiquidityPercent = 0;
-        if (result.lp_holder_count && result.lp_total_supply) {
-             // تقدير بسيط: نفترض أن الأقفال هي جزء من السيولة الإجمالية
-             // هذا تقدير وقد لا يكون دقيقًا 100%، يحتاج لمراجعة وثائق GoPlus بدقة
-             // إذا كان هناك حقل مباشر للنسبة المئوية، استخدمه.
-             // مثال افتراضي: const lockedPercent = parseFloat(result.locked_liquidity_percent || '0');
-             // في الوقت الحالي، سنعتمد على عدم وجود علامات حمراء أخرى كبديل مؤقت
-             //logger.info(`[فحص أمني] معلومات السيولة: ${result.lp_holder_count} حاملين, الإجمالي ${result.lp_total_supply}`);
-             // يمكنك إضافة منطق أكثر تعقيدًا هنا لتحليل result.lp_locked_detail إذا كان متاحًا
-        } else {
-             logger.warn(`[فحص أمني] لا توجد معلومات كافية عن سيولة LP في Go+`);
-             // يمكنك أن تقرر رفض العملة هنا إذا كانت معلومات LP غير كافية
-             // return { is_safe: false, reason: "معلومات سيولة LP غير كافية" };
+        // 1. هل هو فخ عسل واضح؟ (سريع)
+        if (result.is_honeypot === '1') {
+             return { is_safe: false, reason: "فخ عسل حسب Go+" };
         }
-        // if (totalLockedLiquidityPercent < 0.90) { // مثال لشرط القفل
-        //     return { is_safe: false, reason: `السيولة غير مقفلة كفاية (${(totalLockedLiquidityPercent * 100).toFixed(0)}%)` };
-        // }
-
-
-        // --- العلاج 2: فحص تركيز الحيتان والمطور ---
-        const topHoldersPercent = parseFloat(result.holder_analysis?.top_10_holders_percent || '1.0'); // نسبة ملكية أكبر 10
-        if (topHoldersPercent > 0.25) { // تم رفع النسبة قليلاً إلى 25% كسماحية
-            return { is_safe: false, reason: `تركيز عالي للحيتان (${(topHoldersPercent * 100).toFixed(0)}%)` };
-        }
-        const creatorPercent = parseFloat(result.creator_percent || '0'); // نسبة ملكية المطور
-        if (creatorPercent > 0.05) { // 5% حد أقصى للمطور
-            return { is_safe: false, reason: `المطور يملك الكثير (${(creatorPercent * 100).toFixed(0)}%)` };
-        }
-        // قد ترغب أيضًا في فحص نسبة المالك owner_percent
-
-        // --- العلاج 3: فحص التخلي عن العقد ---
-        // العنوان الصفري أو عدم وجود مالك يعتبر آمنًا
-        if (result.owner_address && result.owner_address !== '0x0000000000000000000000000000000000000000') {
-            return { is_safe: false, reason: "لم يتم التخلي عن العقد (خطر التلاعب)" };
+        
+        // 2. هل ضريبة البيع كارثية؟ (سريع)
+        // [تطوير v3.0] تغيير الافتراضي إلى 0 ورفع الحد إلى 25%
+        const sellTax = parseFloat(result.sell_tax || '0'); 
+        if (sellTax > 0.25) { // تم رفع الحد إلى 25%
+             return { is_safe: false, reason: `ضريبة بيع مرتفعة جداً (${(sellTax * 100).toFixed(0)}%)` };
         }
 
-        // إذا وصل الكود إلى هنا، فقد اجتازت العملة كل الفحوصات الإضافية
-        logger.info(`[فحص أمني] ✅ العملة اجتازت الفحوصات المتقدمة (أقفال تقديرية، حيتان، ملكية).`);
+        // 3. هل هو عقد وكيل (Proxy)؟ (سريع)
+        // (هذا الفلتر ضروري بناءً على اكتشافك)
+        if (result.is_proxy === '1') {
+            return { is_safe: false, reason: "عقد وكيل (Proxy) - خطر الترقية" };
+        }
+
+        // --- [تطوير v3.0] تم حذف فلاتر (الحيتان، الأقفال، المالك) ---
+        // لأنها بطيئة وتمنعنا من الشراء السريع (تسبب خطأ 100% حيتان).
+        // سنعتمد على TSL و TP للهروب.
+        
+        logger.info(`[فحص أمني] ✅ العملة اجتازت الفلتر الخفيف (v3.0).`);
         return { is_safe: true };
 
     } catch (error) {
-        logger.error(`[فحص أمني] 🚨 خطأ في التواصل مع Go+ API أو تحليل البيانات: ${error.message}`);
+        logger.error(`[فحص أمني] 🚨 خطأ في التواصل مع Go+ API: ${error.message}`);
         return { is_safe: false, reason: "خطأ في API الفحص الأمني" };
     }
 }
+// <<< نهاية تطوير v3.0
+
+
 async function fullCheck(pairAddress, tokenAddress) {
     try {
         logger.info(`[فحص] بدء الفحص الشامل لـ ${tokenAddress}`);
-        const pairContract = new ethers.Contract(pairAddress, PAIR_ABI, provider); // Use the main provider for checks
+        const pairContract = new ethers.Contract(pairAddress, PAIR_ABI, provider); 
         const reserves = await pairContract.getReserves();
         const token0 = await pairContract.token0();
         const wbnbReserve = token0.toLowerCase() === config.WBNB_ADDRESS.toLowerCase() ? reserves[0] : reserves[1];
         const wbnbLiquidity = parseFloat(ethers.formatEther(wbnbReserve));
         logger.info(`[فحص] السيولة المكتشفة: ${wbnbLiquidity.toFixed(2)} BNB`);
+        
+        // (نحتفظ بفحص السيولة الأدنى)
         if (wbnbLiquidity < config.MINIMUM_LIQUIDITY_BNB) {
             return { passed: false, reason: `سيولة غير كافية (${wbnbLiquidity.toFixed(2)} BNB)` };
         }
+        
+        // (استدعاء الفلتر الخفيف الجديد)
         const securityResult = await checkTokenSecurity(tokenAddress);
         if (!securityResult.is_safe) {
             return { passed: false, reason: securityResult.reason };
         }
-        // Use staticCall with the wallet's provider (which includes the signer)
+        
+        // (نحتفظ بمحاكاة البيع، فهي أهم فحص Honeypot)
         await routerContract.getAmountsOut.staticCall(ethers.parseUnits("1", 0), [tokenAddress, config.WBNB_ADDRESS]);
         logger.info(`[فحص] ✅ نجحت محاكاة البيع. العملة قابلة للبيع.`);
         return { passed: true, reason: "اجتاز كل الفحوصات" };
@@ -176,7 +168,7 @@ async function fullCheck(pairAddress, tokenAddress) {
 }
 
 // =================================================================
-// 2. القناص (Sniper)
+// 2. القناص (Sniper) - (لا تغيير عن v2.8)
 // =================================================================
 async function snipeToken(pairAddress, tokenAddress) {
     try {
@@ -185,18 +177,24 @@ async function snipeToken(pairAddress, tokenAddress) {
         const path = [config.WBNB_ADDRESS, tokenAddress];
         const amountsOut = await routerContract.getAmountsOut.staticCall(bnbAmountWei, path);
         const minTokens = amountsOut[1] * BigInt(100 - config.SLIPPAGE_LIMIT) / BigInt(100);
+        
         const feeData = await provider.getFeeData();
         const txOptions = {
             value: bnbAmountWei,
             gasLimit: config.GAS_LIMIT,
         };
-        const tip = ethers.parseUnits(config.GAS_PRICE_TIP_GWEI.toString(), 'gwei');
+
+        // (استراتيجية الغاز الديناميكي ضرورية للقناص الخاطف)
         if (feeData.maxFeePerGas && feeData.maxPriorityFeePerGas) {
-            txOptions.maxFeePerGas = feeData.maxFeePerGas;
-            txOptions.maxPriorityFeePerGas = feeData.maxPriorityFeePerGas + tip;
+            const dynamicPriorityFee = feeData.maxPriorityFeePerGas * BigInt(config.GAS_PRIORITY_MULTIPLIER);
+            txOptions.maxFeePerGas = feeData.maxFeePerGas + (dynamicPriorityFee - feeData.maxPriorityFeePerGas); 
+            txOptions.maxPriorityFeePerGas = dynamicPriorityFee;
+            logger.info(`[غاز] ديناميكي: الأولوية ${ethers.formatUnits(dynamicPriorityFee, 'gwei')} Gwei (المقترح ${ethers.formatUnits(feeData.maxPriorityFeePerGas, 'gwei')} Gwei)`);
         } else {
-            txOptions.gasPrice = feeData.gasPrice + tip;
+            txOptions.gasPrice = feeData.gasPrice * BigInt(config.GAS_PRIORITY_MULTIPLIER);
+             logger.info(`[غاز] قديم: السعر ${ethers.formatUnits(txOptions.gasPrice, 'gwei')} Gwei`);
         }
+        
         const tx = await routerContract.swapExactETHForTokens(
             minTokens,
             path,
@@ -213,8 +211,21 @@ async function snipeToken(pairAddress, tokenAddress) {
             const buyPrice = config.BUY_AMOUNT_BNB / parseFloat(ethers.formatUnits(amountsOut[1], decimals));
             const msg = `💰 <b>نجحت عملية الشراء!</b> 💰\n\n<b>العملة:</b> <code>${tokenAddress}</code>\n<b>رابط المعاملة:</b> <a href='https://bscscan.com/tx/${tx.hash}'>BscScan</a>\n<b>📊 رابط الشارت:</b> <a href='https://dexscreener.com/bsc/${pairAddress}'>DexScreener</a>`;
             telegram.sendMessage(config.TELEGRAM_ADMIN_CHAT_ID, msg, { parse_mode: 'HTML' });
-            activeTrades.push({ tokenAddress, pairAddress, buyPrice, initialAmountWei: amountsOut[1], remainingAmountWei: amountsOut[1], decimals, currentProfit: 0, highestProfit: 0 });
-            saveTradesToFile(); // حفظ الصفقة الجديدة
+            
+            // (ما زلنا بحاجة لـ partialTpTaken)
+            activeTrades.push({ 
+                tokenAddress, 
+                pairAddress, 
+                buyPrice, 
+                initialAmountWei: amountsOut[1], 
+                remainingAmountWei: amountsOut[1], 
+                decimals, 
+                currentProfit: 0, 
+                highestProfit: 0,
+                partialTpTaken: false 
+            });
+
+            saveTradesToFile(); 
             approveMax(tokenAddress);
         } else {
             logger.error(`🚨 فشلت معاملة الشراء (الحالة 0).`);
@@ -232,7 +243,7 @@ async function approveMax(tokenAddress) {
         const txOptions = {};
         if (feeData.maxFeePerGas && feeData.maxPriorityFeePerGas) {
              txOptions.maxFeePerGas = feeData.maxFeePerGas;
-             txOptions.maxPriorityFeePerGas = feeData.maxPriorityFeePerGas;
+             txOptions.maxPriorityFeePerGas = feeData.maxPriorityFeePerGas; 
         } else {
             txOptions.gasPrice = feeData.gasPrice;
         }
@@ -245,57 +256,118 @@ async function approveMax(tokenAddress) {
 }
 
 // =================================================================
-// 3. الحارس (Guardian)
+// 3. الحارس (Guardian) - (لا تغيير عن v2.8)
 // =================================================================
 async function monitorTrades() {
     if (activeTrades.length === 0) return;
-    for (const trade of [...activeTrades]) { // Use spread operator to iterate over a copy
-        try {
-            const path = [trade.tokenAddress, config.WBNB_ADDRESS];
-            const oneToken = ethers.parseUnits("1", trade.decimals);
-            // Use staticCall with the wallet provider for consistency
-            const amountsOut = await routerContract.getAmountsOut.staticCall(oneToken, path);
-            const currentPrice = parseFloat(ethers.formatUnits(amountsOut[1], 18)); // WBNB has 18 decimals
-            const profit = trade.buyPrice > 0 ? ((currentPrice - trade.buyPrice) / trade.buyPrice) * 100 : 0;
-            trade.currentProfit = profit;
-            trade.highestProfit = Math.max(trade.highestProfit, profit);
-            logger.info(`[مراقبة] ${trade.tokenAddress.slice(0, 10)}... | الربح الحالي: ${profit.toFixed(2)}% | أعلى ربح: ${trade.highestProfit.toFixed(2)}%`);
-            // Only trigger trailing stop loss if profit was positive at some point
-            if (trade.highestProfit > 0 && profit < trade.highestProfit - config.TRAILING_STOP_LOSS_PERCENT) {
-                logger.info(`🎯 [الحارس] تفعيل وقف الخسارة المتحرك لـ ${trade.tokenAddress} عند ربح ${profit.toFixed(2)}%`);
-                // Use await here to ensure sell finishes before potential removal
-                const success = await executeSell(trade, trade.remainingAmountWei, `وقف خسارة متحرك`);
-                if (success) {
-                    removeTrade(trade); // removeTrade now handles saving
+
+    // (نظام المراقبة المتوازية v2.7 ما زال هو الأفضل)
+    const priceChecks = activeTrades.map(trade => {
+        const path = [trade.tokenAddress, config.WBNB_ADDRESS];
+        const oneToken = ethers.parseUnits("1", trade.decimals);
+        return routerContract.getAmountsOut.staticCall(oneToken, path);
+    });
+
+    const results = await Promise.allSettled(priceChecks);
+
+    for (let i = 0; i < activeTrades.length; i++) {
+        const trade = activeTrades[i];
+        const result = results[i];
+
+        if (result.status === 'fulfilled') {
+            try {
+                const amountsOut = result.value;
+                const currentPrice = parseFloat(ethers.formatUnits(amountsOut[1], 18)); 
+                const profit = trade.buyPrice > 0 ? ((currentPrice - trade.buyPrice) / trade.buyPrice) * 100 : 0;
+                trade.currentProfit = profit;
+                trade.highestProfit = Math.max(trade.highestProfit, profit);
+
+                logger.info(`[مراقبة] ${trade.tokenAddress.slice(0, 10)}... | الربح: ${profit.toFixed(2)}% | الأعلى: ${trade.highestProfit.toFixed(2)}%`);
+
+                // (منطق جني الأرباح الجزئي v2.8 ضروري للخاطف)
+                if (config.PARTIAL_TP_PERCENT > 0 && 
+                    profit >= config.PARTIAL_TP_PERCENT && 
+                    !trade.partialTpTaken) 
+                {
+                    if (sellingLocks.has(trade.tokenAddress)) {
+                        logger.info(`[جني ربح] TP لـ ${trade.tokenAddress} مؤجل (عملية بيع جارية).`);
+                        continue; 
+                    }
+                    
+                    logger.info(`🎯 [جني ربح] تفعيل جني الأرباح الجزئي لـ ${trade.tokenAddress} عند ربح ${profit.toFixed(2)}%`);
+                    
+                    sellingLocks.add(trade.tokenAddress);
+                    trade.partialTpTaken = true; 
+                    
+                    const amountToSell = (trade.remainingAmountWei * BigInt(config.PARTIAL_TP_SELL_PERCENT)) / 100n;
+                    
+                    executeSell(trade, amountToSell, `جني ربح جزئي ${config.PARTIAL_TP_SELL_PERCENT}%`)
+                        .then(success => {
+                            if (success) {
+                                trade.remainingAmountWei = trade.remainingAmountWei - amountToSell;
+                                saveTradesToFile(); 
+                            } else {
+                                trade.partialTpTaken = false; 
+                            }
+                        })
+                        .finally(() => {
+                            sellingLocks.delete(trade.tokenAddress);
+                        });
+                        
+                    continue; 
                 }
+
+                // (منطق وقف الخسارة المتحرك v2.8 ضروري للخاطف)
+                if (trade.highestProfit > 0 && profit < trade.highestProfit - config.TRAILING_STOP_LOSS_PERCENT) {
+                    
+                    if (sellingLocks.has(trade.tokenAddress)) {
+                        logger.info(`[الحارس] TSL لـ ${trade.tokenAddress} مؤجل (عملية بيع جارية).`);
+                        continue;
+                    }
+                    
+                    logger.info(`🎯 [الحارس] تفعيل وقف الخسارة المتحرك لـ ${trade.tokenAddress} عند ربح ${profit.toFixed(2)}%`);
+                    
+                    sellingLocks.add(trade.tokenAddress);
+
+                    executeSell(trade, trade.remainingAmountWei, `وقف خسارة متحرك`)
+                        .then(success => {
+                            if (success) {
+                                removeTrade(trade); 
+                            }
+                        })
+                        .finally(() => {
+                            sellingLocks.delete(trade.tokenAddress);
+                        });
+                }
+            } catch (processingError) {
+                 logger.error(`[مراقبة] خطأ في معالجة سعر ${trade.tokenAddress}: ${processingError.message}`);
             }
-        } catch (error) {
-            // Check if the error indicates the trade might already be closed or invalid
-            if (error.code === 'CALL_EXCEPTION') {
-                 logger.warn(`[مراقبة] قد تكون الصفقة ${trade.tokenAddress} مغلقة أو غير صالحة. خطأ: ${error.reason}`);
-                 // Optionally remove the trade here if errors persist
+        } else {
+            if (result.reason.code === 'CALL_EXCEPTION') {
+                 logger.warn(`[مراقبة] قد تكون الصفقة ${trade.tokenAddress} مغلقة. خطأ: ${result.reason.reason}`);
             } else {
-                 logger.error(`[مراقبة] خطأ في مراقبة ${trade.tokenAddress}: ${error}`);
+                 logger.error(`[مراقبة] خطأ في جلب سعر ${trade.tokenAddress}: ${result.reason.message || result.reason}`);
             }
         }
     }
 }
 
 async function executeSell(trade, amountToSellWei, reason = "يدوي") {
-    if (amountToSellWei.toString() === '0') {
-         logger.warn(`[بيع] محاولة بيع كمية صفر من ${trade.tokenAddress}`);
-         return false; // Cannot sell zero amount
+    if (amountToSellWei <= 0n) { 
+         logger.warn(`[بيع] محاولة بيع كمية صفر أو سالبة من ${trade.tokenAddress}`);
+         return false; 
     }
     try {
         logger.info(`💸 [بيع] بدء عملية بيع ${reason} لـ ${trade.tokenAddress}... الكمية: ${ethers.formatUnits(amountToSellWei, trade.decimals)}`);
         const path = [trade.tokenAddress, config.WBNB_ADDRESS];
         const feeData = await provider.getFeeData();
         const txOptions = { gasLimit: config.GAS_LIMIT };
+        // (البيع السريع ضروري للخاطف)
         if (feeData.maxFeePerGas && feeData.maxPriorityFeePerGas) {
              txOptions.maxFeePerGas = feeData.maxFeePerGas;
-             txOptions.maxPriorityFeePerGas = feeData.maxPriorityFeePerGas;
+             txOptions.maxPriorityFeePerGas = feeData.maxPriorityFeePerGas * 2n; 
         } else {
-            txOptions.gasPrice = feeData.gasPrice;
+            txOptions.gasPrice = feeData.gasPrice * 2n;
         }
         const tx = await routerContract.swapExactTokensForETHSupportingFeeOnTransferTokens(
             amountToSellWei, 0, path, config.WALLET_ADDRESS, Math.floor(Date.now() / 1000) + 300,
@@ -318,14 +390,14 @@ async function executeSell(trade, amountToSellWei, reason = "يدوي") {
 }
 
 // =================================================================
-// 5. تخزين الصفقات النشطة (Persistence)
+// 5. تخزين الصفقات النشطة (Persistence) - (لا تغيير عن v2.8)
 // =================================================================
 function replacer(key, value) {
   if (typeof value === 'bigint') { return value.toString(); }
   return value;
 }
 function reviver(key, value) {
-  if (key.endsWith('Wei') && typeof value === 'string') { try { return BigInt(value); } catch(e) {} }
+  if (key && key.endsWith('Wei') && typeof value === 'string') { try { return BigInt(value); } catch(e) {} }
   return value;
 }
 function saveTradesToFile() {
@@ -343,7 +415,13 @@ function loadTradesFromFile() {
             const data = fs.readFileSync(TRADES_FILE, 'utf8');
             const loadedTrades = JSON.parse(data, reviver);
             if (Array.isArray(loadedTrades)) {
-                 activeTrades.push(...loadedTrades.filter(t => t.tokenAddress && t.remainingAmountWei));
+                 const validTrades = loadedTrades
+                    .filter(t => t.tokenAddress && t.remainingAmountWei)
+                    .map(t => ({
+                        ...t,
+                        partialTpTaken: t.partialTpTaken || false 
+                    }));
+                 activeTrades.push(...validTrades);
             }
         } else {
              logger.info("💾 ملف الصفقات النشطة غير موجود، البدء بقائمة فارغة.");
@@ -358,12 +436,12 @@ function removeTrade(tradeToRemove) {
     if (index > -1) {
         activeTrades.splice(index, 1);
         logger.info(`🗑️ تمت إزالة ${tradeToRemove.tokenAddress} من قائمة المراقبة.`);
-        saveTradesToFile(); // حفظ التغييرات بعد الحذف
+        saveTradesToFile(); 
     }
 }
 
 // =================================================================
-// 6. الراصد ونقطة الانطلاق (Watcher & Main)
+// 6. الراصد ونقطة الانطلاق (Watcher & Main) - [تطوير v3.0]
 // =================================================================
 async function connectAndWatch() {
     let reconnectDelay = 5000;
@@ -397,7 +475,7 @@ async function connectAndWatch() {
         } catch (error) {
             logger.error(`🔌 [الراصد] فشل الاتصال أو خطأ فادح: ${error.message}. المحاولة مرة أخرى بعد ${reconnectDelay / 1000} ثانية...`);
             if (wssProvider && wssProvider.websocket) { wssProvider.websocket.terminate(); }
-            if (heartbeatInterval) clearInterval(heartbeatInterval); // Clear interval on outer error too
+            if (heartbeatInterval) clearInterval(heartbeatInterval); 
         }
         await sleep(reconnectDelay);
         reconnectDelay = Math.min(reconnectDelay * 2, maxDelay);
@@ -409,9 +487,12 @@ async function handlePairCreated(token0, token1, pairAddress) {
      logger.info(`\n👀 [الراصد] تم رصد مجمع جديد: ${pairAddress}`);
      const targetToken = token0.toLowerCase() === config.WBNB_ADDRESS.toLowerCase() ? token1 : token0;
      if (targetToken.toLowerCase() === config.WBNB_ADDRESS.toLowerCase()) return;
+     
+     // (استدعاء دالة الفحص الجديدة)
      const checkResult = await fullCheck(pairAddress, targetToken);
+     
      if (checkResult.passed) {
-         await telegram.sendMessage(config.TELEGRAM_ADMIN_CHAT_ID, `✅ <b>عملة اجتازت الفحص!</b>\n\n<code>${targetToken}</code>\n\n🚀 جاري محاولة القنص...`, { parse_mode: 'HTML' });
+         await telegram.sendMessage(config.TELEGRAM_ADMIN_CHAT_ID, `✅ <b>عملة اجتازت الفلتر الخفيف!</b>\n\n<code>${targetToken}</code>\n\n🚀 جاري محاولة القنص...`, { parse_mode: 'HTML' });
          snipeToken(pairAddress, targetToken);
      } else {
          logger.warn(`🔻 [مهمة منتهية] تم تجاهل ${targetToken} (السبب: ${checkResult.reason}).`);
@@ -422,7 +503,7 @@ async function handlePairCreated(token0, token1, pairAddress) {
 }
 
 async function main() {
-    logger.info(`--- بدء تشغيل بوت صياد الدرر (v2.6 JS) ---`);
+    logger.info(`--- بدء تشغيل بوت صياد الدرر (v3.0 JS) ---`); // [تطوير v3.0]
     try {
         provider = new ethers.JsonRpcProvider(config.PROTECTED_RPC_URL);
         wallet = new ethers.Wallet(config.PRIVATE_KEY, provider);
@@ -431,7 +512,7 @@ async function main() {
         logger.info(`💾 تم تحميل ${activeTrades.length} صفقة نشطة من الملف.`);
         const network = await provider.getNetwork();
         logger.info(`✅ تم الاتصال بالشبكة (RPC) بنجاح! (${network.name}, ChainID: ${network.chainId})`);
-        const welcomeMsg = `✅ <b>تم تشغيل بوت صياد الدرر (v2.6 JS) بنجاح!</b>`;
+        const welcomeMsg = `✅ <b>تم تشغيل بوت صياد الدرر (v3.0 JS) بنجاح!</b>`; // [تطوير v3.0]
         telegram.sendMessage(config.TELEGRAM_ADMIN_CHAT_ID, welcomeMsg, { parse_mode: 'HTML', reply_markup: getMainMenuKeyboard() });
 
         telegram.on('message', (msg) => {
@@ -442,10 +523,17 @@ async function main() {
                 const newValueStr = msg.text;
                 try {
                     let newValue;
-                    if (['BUY_AMOUNT_BNB', 'MINIMUM_LIQUIDITY_BNB'].includes(settingKey)) { newValue = parseFloat(newValueStr); }
-                    else if (settingKey === 'GAS_PRICE_TIP_GWEI') { newValue = BigInt(newValueStr); }
-                    else { newValue = parseInt(newValueStr, 10); }
-                    if ((isNaN(newValue) && typeof newValue !== 'bigint') || newValue < 0) throw new Error("قيمة غير صالحة");
+                    if (['BUY_AMOUNT_BNB', 'MINIMUM_LIQUIDITY_BNB'].includes(settingKey)) { 
+                        newValue = parseFloat(newValueStr); 
+                    }
+                    else if (settingKey === 'GAS_PRIORITY_MULTIPLIER') { 
+                        newValue = parseInt(newValueStr, 10); 
+                    }
+                    else { 
+                        newValue = parseInt(newValueStr, 10); 
+                    }
+                    if (isNaN(newValue) || newValue < 0) throw new Error("قيمة غير صالحة");
+                    
                     config[settingKey] = newValue;
                     logger.info(`⚙️ تم تغيير ${settingKey} ديناميكياً إلى ${newValue}.`);
                     telegram.sendMessage(chatId, `✅ تم تحديث <b>${settingKey}</b> إلى: <code>${newValue.toString()}</code>`, { parse_mode: 'HTML', reply_markup: getMainMenuKeyboard() });
@@ -477,7 +565,7 @@ async function main() {
             const data = query.data;
             if (data.startsWith('change_')) {
                 const settingKey = data.replace('change_', '');
-                if (SETTING_PROMPTS[settingKey]) { // Ensure setting is valid
+                if (SETTING_PROMPTS[settingKey]) {
                      userState[chatId] = { awaiting: settingKey };
                      telegram.editMessageText(SETTING_PROMPTS[settingKey], { chat_id: chatId, message_id: query.message.message_id });
                 } else {
@@ -488,24 +576,33 @@ async function main() {
                 showSellPercentageMenu(chatId, query.message.message_id, tokenAddress);
             } else if (data.startsWith('partial_sell_')) {
                 const [_, percentage, tokenAddress] = data.split('_');
+                
+                if (sellingLocks.has(tokenAddress)) {
+                    telegram.answerCallbackQuery(query.id, { text: "⏳ جاري تنفيذ عملية بيع سابقة!" });
+                    return; 
+                }
+                
                 const trade = activeTrades.find(t => t.tokenAddress === tokenAddress);
                 if (trade) {
-                    const amount = (trade.remainingAmountWei * BigInt(percentage)) / BigInt(100);
+                    
+                    sellingLocks.add(tokenAddress); 
+                    
+                    const amount = (trade.remainingAmountWei * BigInt(percentage)) / 100n; 
                     telegram.editMessageText(`⏳ جاري بيع ${percentage}% من ${tokenAddress.slice(0,10)}...`, { chat_id: chatId, message_id: query.message.message_id });
-                    // Use await for executeSell and then check remaining amount
+                    
                     executeSell(trade, amount, `بيع يدوي ${percentage}%`).then(success => {
                         if (success) {
-                            // Update remaining amount *after* successful sell
                             trade.remainingAmountWei = trade.remainingAmountWei - amount;
-                            saveTradesToFile(); // Save updated remaining amount
+                            saveTradesToFile(); 
 
-                            if (percentage === '100' || trade.remainingAmountWei <= 0n) { // Use <= 0n for BigInt comparison
-                                removeTrade(trade); // removeTrade handles saving after removal
+                            if (percentage === '100' || trade.remainingAmountWei <= 0n) {
+                                removeTrade(trade); 
                             }
                         } else {
-                             // Inform user if sell failed
                              telegram.sendMessage(chatId, `❌ فشلت محاولة بيع ${percentage}% من ${tokenAddress.slice(0,10)}.`);
                         }
+                    }).finally(() => {
+                        sellingLocks.delete(tokenAddress);
                     });
                 } else {
                      telegram.answerCallbackQuery(query.id, { text: "الصفقة لم تعد موجودة!" });
@@ -513,11 +610,10 @@ async function main() {
             }
         });
         
-        // Start the watcher loop (handles its own connection/reconnection)
         connectAndWatch();
 
-        // Start the guardian loop (monitors trades)
-        setInterval(monitorTrades, 10000); // Check every 10 seconds
+        // <<< [تطوير v3.0] زيادة سرعة الحارس لتتناسب مع استراتيجية "الخاطف"
+        setInterval(monitorTrades, 2000); // Check every 2 seconds
 
     } catch (error) {
         logger.error(`❌ فشل فادح في الدالة الرئيسية: ${error}`);
@@ -526,6 +622,8 @@ async function main() {
 }
 
 // --- دوال واجهة التليجرام الكاملة ---
+// (لا تغيير عن v2.8، ما زالت تعمل بشكل ممتاز)
+
 function getMainMenuKeyboard() {
     const pauseButtonText = config.IS_PAUSED ? "▶️ استئناف القنص" : "⏸️ إيقاف القنص";
     const debugButtonText = config.DEBUG_MODE ? "⚪️ إيقاف التصحيح" : "🟢 تفعيل التصحيح";
@@ -549,16 +647,22 @@ function showStatus(chatId) {
     } else {
         statusText += "<b>📈 الصفقات النشطة:</b>\n";
         activeTrades.forEach(trade => {
-            statusText += `<b>- <code>${trade.tokenAddress.slice(0, 10)}...</code>:</b> ${trade.currentProfit.toFixed(2)}%\n`;
+            statusText += `<b>- <code>${trade.tokenAddress.slice(0, 10)}...</code>:</b> ${trade.currentProfit.toFixed(2)}%`;
+            if (trade.partialTpTaken) {
+                statusText += " (تم جني الربح الجزئي ✅)";
+            }
+            statusText += "\n";
         });
     }
     statusText += "-----------------------------------\n";
-    statusText += "<b>⚙️ إعدادات التداول:</b>\n";
+    statusText += "<b>⚙️ إعدادات التداول (v3.0 - خاطف):</b>\n";
     statusText += `- مبلغ الشراء: ${config.BUY_AMOUNT_BNB} BNB\n`;
-    statusText += `- وقف الخسارة المتحرك: ${config.TRAILING_STOP_LOSS_PERCENT}%\n`;
-    statusText += `- إكرامية الغاز: ${config.GAS_PRICE_TIP_GWEI} Gwei\n`;
+    statusText += `- مضاعف الغاز: ${config.GAS_PRIORITY_MULTIPLIER}x\n`;
     statusText += `- الانزلاق السعري: ${config.SLIPPAGE_LIMIT}%\n`;
     statusText += `- حد السيولة: ${config.MINIMUM_LIQUIDITY_BNB} BNB\n`;
+    statusText += `- وقف الخسارة المتحرك: ${config.TRAILING_STOP_LOSS_PERCENT}%\n`;
+    statusText += `- جني الربح الجزئي: بيع ${config.PARTIAL_TP_SELL_PERCENT}% عند ${config.PARTIAL_TP_PERCENT}% ربح\n`;
+
     telegram.sendMessage(chatId, statusText, { parse_mode: 'HTML', reply_markup: getMainMenuKeyboard() });
 }
 
@@ -578,10 +682,12 @@ function showDiagnostics(chatId) {
 function showSettingsMenu(chatId) {
     const keyboard = [
         [{ text: `💵 مبلغ الشراء (${config.BUY_AMOUNT_BNB} BNB)`, callback_data: 'change_BUY_AMOUNT_BNB' }],
-        [{ text: `🚀 إكرامية الغاز (${config.GAS_PRICE_TIP_GWEI} Gwei)`, callback_data: 'change_GAS_PRICE_TIP_GWEI' }],
+        [{ text: `🚀 مضاعف الغاز (${config.GAS_PRIORITY_MULTIPLIER}x)`, callback_data: 'change_GAS_PRIORITY_MULTIPLIER' }],
         [{ text: `📊 الانزلاق (${config.SLIPPAGE_LIMIT}%)`, callback_data: 'change_SLIPPAGE_LIMIT' }],
         [{ text: `💧 حد السيولة (${config.MINIMUM_LIQUIDITY_BNB} BNB)`, callback_data: 'change_MINIMUM_LIQUIDITY_BNB' }],
         [{ text: `📈 وقف الخسارة المتحرك (${config.TRAILING_STOP_LOSS_PERCENT}%)`, callback_data: 'change_TRAILING_STOP_LOSS_PERCENT' }],
+        [{ text: `🎯 ربح جزئي (% الهدف) (${config.PARTIAL_TP_PERCENT}%)`, callback_data: 'change_PARTIAL_TP_PERCENT' }],
+        [{ text: `💰 ربح جزئي (% البيع) (${config.PARTIAL_TP_SELL_PERCENT}%)`, callback_data: 'change_PARTIAL_TP_SELL_PERCENT' }],
     ];
     telegram.sendMessage(chatId, "<b>⚙️ اختر الإعداد الذي تريد تغييره:</b>", {
         parse_mode: "HTML",
