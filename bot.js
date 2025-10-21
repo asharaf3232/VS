@@ -444,8 +444,8 @@ async function fetchTrendingPairs() {
     }
     
     try {
-        const query = 'age:h1 chain:bsc';
-        const url = `https://api.dexscreener.com/latest/dex/search?q=${query}`;
+        
+        const url = 'https://api.dexscreener.com/latest/dex/screener/pairs/bsc/v3?rankby=trendingScoreH6&order=desc&minLiq=50000&min1HTxns=50&min1HVol=20000';
 
         
         logger.info("[راصد الزخم] جاري البحث عن أهداف جديدة...");
