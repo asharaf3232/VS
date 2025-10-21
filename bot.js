@@ -1,5 +1,5 @@
 // =================================================================
-// صياد الدرر: v9.2 (الصقر الحكيم - راصد الزخم المبكر + درع فولاذي)
+// صياد الدرر: v9.2 (الصقر الحكيم - راصد الزخم المبكر + درع فولاذي) - إصلاحات الأخطاء
 // =================================================================
 import { ethers } from 'ethers';
 import dotenv from 'dotenv';
@@ -61,6 +61,8 @@ const sellingLocks = new Set();
 const processedPairs = new Set(); // (للبوت v9.0)
 // <<< [تطوير v9.2] متغير التحكم في التزامن للصقر الحكيم >>>
 let isWiseHawkHunting = false;
+// <<< إصلاح جديد: متغير لعدد الـ pairs في الدورة الأخيرة >>>
+let lastPairsFound = 0;
 const SETTING_PROMPTS = {
     "BUY_AMOUNT_BNB": "يرجى إرسال مبلغ الشراء الجديد بالـ BNB (مثال: 0.01):",
     "GAS_PRIORITY_MULTIPLIER": "يرجى إرسال مضاعف غاز الأولوية الجديد (مثال: 2 يعني ضعف المقترح):",
@@ -72,7 +74,7 @@ const SETTING_PROMPTS = {
 };
 
 // =================================================================
-// 1. المدقق (Verifier) - [تطوير v9.2: درع فولاذي]
+// 1. المدقق (Verifier) - [تطوير v9.2: درعفولاذي + إصلاح BUFFER_OVERRUN]
 // =================================================================
 async function sleep(ms) {
     return new Promise(resolve => setTimeout(resolve, ms));
@@ -90,8 +92,8 @@ async function checkTokenSecurity(tokenAddress, retry = true) {
 
         if (!result) {
             if (retry) {
-                logger.warn(`[فحص أمني] لم يتم العثور على العملة في Go+، سأنتظر 1 ثانية وأحاول مرة أخرى.`);
-                await sleep(1000); 
+                logger.warn(`[فحص أمني] لم يتم العثور على العملة في Go+، سأنتظر 2 ثواني وأحاول مرة أخرى.`);
+                await sleep(2000); 
                 return checkTokenSecurity(tokenAddress, false);
             }
             return { is_safe: false, reason: "لم يتم العثور على العملة في Go+" };
@@ -163,8 +165,21 @@ async function fullCheck(pairAddress, tokenAddress) {
         if (!securityResult.is_safe) {
             return { passed: false, reason: securityResult.reason };
         }
+
+        // <<< إصلاح BUFFER_OVERRUN: جلب decimals واستخدام 1 token كامل >>>
+        const tokenContract = new ethers.Contract(tokenAddress, ERC20_ABI, provider);
+        let decimals;
+        try {
+            decimals = await tokenContract.decimals();
+            decimals = Number(decimals);
+        } catch (e) {
+            logger.warn(`[فحص] فشل في جلب decimals لـ ${tokenAddress}، افتراضي 18`);
+            decimals = 18;
+        }
+        const amountIn = ethers.parseUnits("1", decimals);  // 1 token كامل
+        await routerContract.getAmountsOut.staticCall(amountIn, [tokenAddress, config.WBNB_ADDRESS]);
+        // <<< نهاية الإصلاح >>>
         
-        await routerContract.getAmountsOut.staticCall(ethers.parseUnits("1", 0), [tokenAddress, config.WBNB_ADDRESS]);
         logger.info(`[فحص] ✅ نجحت محاكاة البيع. العملة قابلة للبيع.`);
         return { passed: true, reason: "اجتاز كل الفحوصات" };
     } catch (error) {
@@ -174,7 +189,7 @@ async function fullCheck(pairAddress, tokenAddress) {
 }
 
 // =================================================================
-// 2. القناص (Sniper) - (المستثمر)
+// 2. القناص (Sniper) - (المستثمر) - (لا تغيير)
 // =================================================================
 async function snipeToken(pairAddress, tokenAddress) {
     if (activeTrades.some(t => t.tokenAddress === tokenAddress)) {
@@ -464,7 +479,7 @@ function removeTrade(tradeToRemove) {
 }
 
 // =================================================================
-// 6. الراصد ونقطة الانطلاق (v9.2 "الصقر الحكيم")
+// 6. الراصد ونقطة الانطلاق (v9.2 "الصقر الحكيم") - [إصلاح 404 + فلترة client-side]
 // =================================================================
 async function fetchTrendingPairs() {
     if (config.IS_PAUSED) {
@@ -473,20 +488,38 @@ async function fetchTrendingPairs() {
     }
     
     try {
-        // <<< [تطوير v9.2] استعلام مبكر للدخول السريع (1-10 دقائق، سيولة >5000، نشاط أولي) >>>
-        const query = 'age:m1 age:m10 liquidity:5000 txns:m5:5 vol:m5:1000 chain:bsc sort:age';
-        const url = `https://api.dexscreener.com/latest/dex/pairs/search?q=${query}`;
+        // <<< إصلاح 404: URL صحيح + query مدعوم >>>
+        let query = 'chain:bsc';  // بحث عن pairs على BSC
+        let url = `https://api.dexscreener.com/latest/dex/search/?q=${query}`;
         
-        logger.info("[الصقر الحكيم] جاري البحث عن أهداف مبكرة...");
-        const response = await axios.get(url, { headers: { 'Accept': 'application/json' } });
+        logger.info(`[الصقر الحكيم] جاري البحث عن أهداف مبكرة باستخدام query: ${query}...`);
+        let response = await axios.get(url, { headers: { 'Accept': 'application/json' } });
         
-        if (response.data && response.data.pairs) {
-            logger.info(`[الصقر الحكيم] تم العثور على ${response.data.pairs.length} هدف محتمل مبكر.`);
+        if (response.data && response.data.pairs && response.data.pairs.length > 0) {
+            lastPairsFound = response.data.pairs.length;
+            logger.info(`[الصقر الحكيم] تم العثور على ${lastPairsFound} هدف محتمل مبكر.`);
             return response.data.pairs;
+        } else {
+            // Fallback: جرب query أوسع إذا لم يجد
+            logger.warn(`[الصقر الحكيم] لم يتم العثور على pairs، جاري تجربة query أوسع: 'bsc'`);
+            query = 'bsc';
+            url = `https://api.dexscreener.com/latest/dex/search/?q=${query}`;
+            response = await axios.get(url, { headers: { 'Accept': 'application/json' } });
+            if (response.data && response.data.pairs) {
+                lastPairsFound = response.data.pairs.length;
+                logger.info(`[الصقر الحكيم] تم العثور على ${lastPairsFound} هدف من fallback.`);
+                return response.data.pairs;
+            }
+            lastPairsFound = 0;
+            return [];
         }
-        return [];
     } catch (error) {
-        logger.error(`[الصقر الحكيم] ❌ خطأ في جلب البيانات من DexScreener: ${error.message}`);
+        if (error.response && error.response.status === 404) {
+            logger.error(`[الصقر الحكيم] ❌ 404: endpoint غير صحيح، تحقق من الـ URL. خطأ: ${error.message}`);
+        } else {
+            logger.error(`[الصقر الحكيم] ❌ خطأ في جلب البيانات من DexScreener: ${error.message}`);
+        }
+        lastPairsFound = 0;
         return [];
     }
 }
@@ -495,22 +528,39 @@ async function processNewTarget(pair) {
     const pairAddress = pair.pairAddress;
     const tokenAddress = pair.baseToken.address;
 
+    // <<< إصلاح: فلترة client-side للدخول المبكر (عمر <10 دقائق، سيولة >5000 USD، نشاط أولي) >>>
+    const pairAgeMs = Date.now() - new Date(pair.pairCreatedAt).getTime();
+    const pairAgeMin = pairAgeMs / (1000 * 60);
+    if (pairAgeMin > 10) {
+        if (config.DEBUG_MODE) logger.info(`[فلتر] تجاهل ${tokenAddress} (عمر >10 دقائق: ${pairAgeMin.toFixed(1)} دقيقة)`);
+        return;
+    }
+
+    const liquidityUsd = pair.liquidity ? pair.liquidity.usd : 0;
+    if (liquidityUsd < 5000) {
+        if (config.DEBUG_MODE) logger.info(`[فلتر] تجاهل ${tokenAddress} (سيولة <5000 USD: ${liquidityUsd})`);
+        return;
+    }
+
+    // فلتر نشاط أولي (h5 إذا متوفر، وإلا h1)
+    const txnsPeriod = pair.txns && pair.txns.h5 ? 'h5' : 'h1';
+    const buys = pair.txns ? pair.txns[txnsPeriod]?.buys || 0 : 0;
+    const volumePeriod = pair.volume ? pair.volume[txnsPeriod] || 0 : 0;
+    if (buys < 5 || volumePeriod < 1000) {
+        logger.warn(`🔻 [فلتر نشاط] تم تجاهل ${tokenAddress} (نشاط ضعيف: ${buys} شراء، ${volumePeriod.toFixed(0)}$ حجم في ${txnsPeriod})`);
+        if (config.DEBUG_MODE) {
+            await telegram.sendMessage(config.TELEGRAM_ADMIN_CHAT_ID, `⚪️ <b>تم تجاهل عملة مبكرة</b>\n\n<code>${tokenAddress}</code>\n\n<b>السبب:</b> نشاط أولي ضعيف`, { parse_mode: 'HTML' });
+        }
+        return;
+    }
+    // <<< نهاية الإصلاح >>>
+
     logger.info(`\n🔥 [هدف محتمل!] تم العثور على عملة ذات زخم مبكر: ${pair.baseToken.symbol} (${tokenAddress.slice(0, 10)}...)`);
     logger.info(`   - الرابط: https://dexscreener.com/bsc/${pairAddress}`);
     
     const checkResult = await fullCheck(pairAddress, tokenAddress); 
     
     if (checkResult.passed) {
-        // <<< [تطوير v9.2] فلتر نبض الحياة الأولي >>>
-        if (pair.txns && pair.txns.m5 && pair.txns.m5.buys < 5 || pair.volume && pair.volume.m5 < 1000) {
-            logger.warn(`🔻 [مهمة منتهية] تم تجاهل ${tokenAddress} (السبب: نشاط أولي ضعيف جداً - <5 شراء أو <1000$ حجم في 5 دقائق).`);
-            if (config.DEBUG_MODE) {
-                await telegram.sendMessage(config.TELEGRAM_ADMIN_CHAT_ID, `⚪️ <b>تم تجاهل عملة مبكرة</b>\n\n<code>${tokenAddress}</code>\n\n<b>السبب:</b> نشاط أولي ضعيف`, { parse_mode: 'HTML' });
-            }
-            return;
-        }
-        // <<< نهاية تطوير v9.2 >>>
-
         // <<< [تطوير v9.2] التحكم في التزامن: صقر واحد فقط >>>
         if (isWiseHawkHunting) {
             logger.info(`[الصقر الحكيم] تجاهل ${tokenAddress}، هناك عملية صيد نشطة بالفعل.`);
@@ -554,13 +604,13 @@ async function pollForMomentum() {
             logger.error(`❌ خطأ في حلقة "الصقر الحكيم" الرئيسية: ${error.message}`);
         }
         
-        logger.info(`[الصقر الحكيم] اكتمل البحث. في انتظار 10 دقائق (حتى ${new Date(Date.now() + 10 * 60 * 1000).toLocaleTimeString()})...`);
+        logger.info(`[الصقر الحكيم] اكتمل البحث (${lastPairsFound} هدف مكتشف). في انتظار 10 دقائق (حتى ${new Date(Date.now() + 10 * 60 * 1000).toLocaleTimeString()})...`);
         await sleep(10 * 60 * 1000); // 10 دقائق
     }
 }
 
 // =================================================================
-// 7. الدالة الرئيسية (Main)
+// 7. الدالة الرئيسية (Main) - (لا تغيير كبير)
 // =================================================================
 async function main() {
     logger.info(`--- بدء تشغيل بوت صياد الدرر (v9.2 - الصقر الحكيم) ---`);
@@ -705,7 +755,7 @@ async function main() {
 }
 
 // =================================================================
-// 8. دوال واجهة التليجرام (Telegram UI) - (لا تغيير كبير)
+// 8. دوال واجهة التليجرام (Telegram UI) - [إضافة lastPairsFound في الحالة]
 // =================================================================
 
 function getMainMenuKeyboard() {
@@ -722,12 +772,13 @@ function getMainMenuKeyboard() {
     };
 }
 
-// <<< [تطوير v9.1] تحويل الدالة إلى async لجلب الأرصدة >>>
+// <<< [تطوير v9.1 + إصلاح جديد] تحويل الدالة إلى async لجلب الأرصدة + عرض lastPairsFound >>>
 async function showStatus(chatId) {
     let statusText = "<b>📊 الحالة الحالية للبوت (v9.2 - الصقر الحكيم):</b>\n\n";
     statusText += `<b>حالة البحث:</b> ${config.IS_PAUSED ? 'موقوف مؤقتاً ⏸️' : 'نشط ▶️'}\n`;
     statusText += `<b>وضع التصحيح:</b> ${config.DEBUG_MODE ? 'فعّال 🟢' : 'غير فعّال ⚪️'}\n`;
-    statusText += `<b>حالة الصقر:</b> ${isWiseHawkHunting ? 'يصطاد 🦅' : 'جاهز للصيد'}\n`; // <<< [تطوير v9.2]
+    statusText += `<b>حالة الصقر:</b> ${isWiseHawkHunting ? 'يصطاد 🦅' : 'جاهز للصيد'}\n`;
+    statusText += `<b>أهداف مكتشفة في الدورة الأخيرة:</b> ${lastPairsFound}\n`; // <<< إصلاح جديد >>>
     statusText += "-----------------------------------\n";
 
     // --- جلب رصيد BNB ---
