@@ -444,10 +444,11 @@ async function fetchTrendingPairs() {
     }
     
     try {
-        
-        const url = 'https://api.dexscreener.com/latest/dex/screener/pairs/bsc/v3?rankby=trendingScoreH6&order=desc&minLiq=50000&min1HTxns=50&min1HVol=20000';
+        // === هذا هو التعديل ===
+        const query = 'chain:bsc AND minLiq:>50000 AND min1HTxns:>50 AND min1HVol:>20000 AND rankBy:trendingScoreH6';
+        const url = `https://api.dexscreener.com/latest/dex/search?q=${query}`;
+        // === نهاية التعديل ===
 
-        
         logger.info("[راصد الزخم] جاري البحث عن أهداف جديدة...");
         const response = await axios.get(url, { headers: { 'Accept': 'application/json' } });
         
@@ -461,7 +462,6 @@ async function fetchTrendingPairs() {
         return [];
     }
 }
-
 async function processNewTarget(pair) {
     const pairAddress = pair.pairAddress;
     const tokenAddress = pair.baseToken.address;
