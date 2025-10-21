@@ -1,5 +1,5 @@
 // =================================================================
-// صياد الدرر: v9.1 (راصد الزخم + إدارة المحفظة)
+// صياد الدرر: v9.2 (الصقر الحكيم - راصد الزخم المبكر + درع فولاذي)
 // =================================================================
 import { ethers } from 'ethers';
 import dotenv from 'dotenv';
@@ -59,6 +59,8 @@ const userState = {};
 const TRADES_FILE = 'active_trades.json';
 const sellingLocks = new Set();
 const processedPairs = new Set(); // (للبوت v9.0)
+// <<< [تطوير v9.2] متغير التحكم في التزامن للصقر الحكيم >>>
+let isWiseHawkHunting = false;
 const SETTING_PROMPTS = {
     "BUY_AMOUNT_BNB": "يرجى إرسال مبلغ الشراء الجديد بالـ BNB (مثال: 0.01):",
     "GAS_PRIORITY_MULTIPLIER": "يرجى إرسال مضاعف غاز الأولوية الجديد (مثال: 2 يعني ضعف المقترح):",
@@ -70,7 +72,7 @@ const SETTING_PROMPTS = {
 };
 
 // =================================================================
-// 1. المدقق (Verifier)
+// 1. المدقق (Verifier) - [تطوير v9.2: درع فولاذي]
 // =================================================================
 async function sleep(ms) {
     return new Promise(resolve => setTimeout(resolve, ms));
@@ -107,8 +109,33 @@ async function checkTokenSecurity(tokenAddress, retry = true) {
         if (result.is_proxy === '1') {
             return { is_safe: false, reason: "عقد وكيل (Proxy) - خطر الترقية" };
         }
+
+        // <<< [تطوير v9.2] فحوصات الدرع الفولاذي >>>
+        // فحص قفل السيولة
+        const lockedPercent = parseFloat(result.lp_locked_percent || '0');
+        if (lockedPercent < 0.95) {
+            return { is_safe: false, reason: `السيولة غير مقفلة كفاية (${(lockedPercent * 100).toFixed(0)}%)` };
+        }
+
+        // فحص تركيز الحيتان
+        const topHoldersPercent = parseFloat(result.top_10_holders_percent || '1');
+        if (topHoldersPercent > 0.20) {
+            return { is_safe: false, reason: `تركيز عالي للحيتان (${(topHoldersPercent * 100).toFixed(0)}%)` };
+        }
+
+        // فحص نسبة المطور
+        const creatorPercent = parseFloat(result.creator_percent || '0');
+        if (creatorPercent > 0.05) {
+            return { is_safe: false, reason: `المطور يملك الكثير (${(creatorPercent * 100).toFixed(0)}%)` };
+        }
+
+        // فحص التخلي عن العقد
+        if (result.owner_address && result.owner_address !== '0x0000000000000000000000000000000000000000') {
+            return { is_safe: false, reason: "لم يتم التخلي عن العقد" };
+        }
+        // <<< نهاية تطوير v9.2 >>>
         
-        logger.info(`[فحص أمني] ✅ العملة اجتازت الفلتر الأمني.`);
+        logger.info(`[فحص أمني] ✅ العملة اجتازت الفلتر الأمني الشامل.`);
         return { is_safe: true };
 
     } catch (error) {
@@ -379,7 +406,7 @@ async function executeSell(trade, amountToSellWei, reason = "يدوي") {
 }
 
 // =================================================================
-// 5. تخزين الصفقات النشطة (Persistence) - (لا تغيير)
+// 5. تخزين الصفقات النشطة (Persistence) - [تطوير v9.2: تحرير القفل عند الإزالة]
 // =================================================================
 function replacer(key, value) {
   if (typeof value === 'bigint') { return value.toString(); }
@@ -431,11 +458,13 @@ function removeTrade(tradeToRemove) {
         activeTrades.splice(index, 1);
         logger.info(`🗑️ تمت إزالة ${tradeToRemove.tokenAddress} من قائمة المراقبة.`);
         saveTradesToFile(); 
+        // <<< [تطوير v9.2] تحرير قفل الصقر الحكيم عند إغلاق الصفقة >>>
+        isWiseHawkHunting = false;
     }
 }
 
 // =================================================================
-// 6. الراصد ونقطة الانطلاق (v9.0 "راصد الزخم")
+// 6. الراصد ونقطة الانطلاق (v9.2 "الصقر الحكيم")
 // =================================================================
 async function fetchTrendingPairs() {
     if (config.IS_PAUSED) {
@@ -444,36 +473,60 @@ async function fetchTrendingPairs() {
     }
     
     try {
-        // === هذا هو التعديل ===
-        const query = 'chain:bsc AND minLiq:>50000 AND min1HTxns:>50 AND min1HVol:>20000 AND rankBy:trendingScoreH6';
-        const url = `https://api.dexscreener.com/latest/dex/search?q=${query}`;
-        // === نهاية التعديل ===
-
-        logger.info("[راصد الزخم] جاري البحث عن أهداف جديدة...");
+        // <<< [تطوير v9.2] استعلام مبكر للدخول السريع (1-10 دقائق، سيولة >5000، نشاط أولي) >>>
+        const query = 'age:m1 age:m10 liquidity:5000 txns:m5:5 vol:m5:1000 chain:bsc sort:age';
+        const url = `https://api.dexscreener.com/latest/dex/pairs/search?q=${query}`;
+        
+        logger.info("[الصقر الحكيم] جاري البحث عن أهداف مبكرة...");
         const response = await axios.get(url, { headers: { 'Accept': 'application/json' } });
         
         if (response.data && response.data.pairs) {
-            logger.info(`[راصد الزخم] تم العثور على ${response.data.pairs.length} هدف محتمل.`);
+            logger.info(`[الصقر الحكيم] تم العثور على ${response.data.pairs.length} هدف محتمل مبكر.`);
             return response.data.pairs;
         }
         return [];
     } catch (error) {
-        logger.error(`[راصد الزخم] ❌ خطأ في جلب البيانات من DexScreener: ${error.message}`);
+        logger.error(`[الصقر الحكيم] ❌ خطأ في جلب البيانات من DexScreener: ${error.message}`);
         return [];
     }
 }
+
 async function processNewTarget(pair) {
     const pairAddress = pair.pairAddress;
     const tokenAddress = pair.baseToken.address;
 
-    logger.info(`\n🔥 [هدف محتمل!] تم العثور على عملة ذات زخم: ${pair.baseToken.symbol} (${tokenAddress.slice(0, 10)}...)`);
+    logger.info(`\n🔥 [هدف محتمل!] تم العثور على عملة ذات زخم مبكر: ${pair.baseToken.symbol} (${tokenAddress.slice(0, 10)}...)`);
     logger.info(`   - الرابط: https://dexscreener.com/bsc/${pairAddress}`);
     
     const checkResult = await fullCheck(pairAddress, tokenAddress); 
     
     if (checkResult.passed) {
-        await telegram.sendMessage(config.TELEGRAM_ADMIN_CHAT_ID, `✅ <b>عملة اجتازت فحص الزخم والأمان!</b>\n\n<b>العملة:</b> ${pair.baseToken.symbol} (<code>${tokenAddress}</code>)\n\n🚀 جاري محاولة الاستثمار...`, { parse_mode: 'HTML' });
-        snipeToken(pairAddress, tokenAddress); 
+        // <<< [تطوير v9.2] فلتر نبض الحياة الأولي >>>
+        if (pair.txns && pair.txns.m5 && pair.txns.m5.buys < 5 || pair.volume && pair.volume.m5 < 1000) {
+            logger.warn(`🔻 [مهمة منتهية] تم تجاهل ${tokenAddress} (السبب: نشاط أولي ضعيف جداً - <5 شراء أو <1000$ حجم في 5 دقائق).`);
+            if (config.DEBUG_MODE) {
+                await telegram.sendMessage(config.TELEGRAM_ADMIN_CHAT_ID, `⚪️ <b>تم تجاهل عملة مبكرة</b>\n\n<code>${tokenAddress}</code>\n\n<b>السبب:</b> نشاط أولي ضعيف`, { parse_mode: 'HTML' });
+            }
+            return;
+        }
+        // <<< نهاية تطوير v9.2 >>>
+
+        // <<< [تطوير v9.2] التحكم في التزامن: صقر واحد فقط >>>
+        if (isWiseHawkHunting) {
+            logger.info(`[الصقر الحكيم] تجاهل ${tokenAddress}، هناك عملية صيد نشطة بالفعل.`);
+            return;
+        }
+        isWiseHawkHunting = true; // اقفل الصيد
+        // <<< نهاية تطوير v9.2 >>>
+
+        await telegram.sendMessage(config.TELEGRAM_ADMIN_CHAT_ID, `✅ <b>عملة اجتازت فحص الزخم المبكر والأمان الفولاذي!</b>\n\n<b>العملة:</b> ${pair.baseToken.symbol} (<code>${tokenAddress}</code>)\n\n🚀 جاري محاولة الاستثمار...`, { parse_mode: 'HTML' });
+        
+        try {
+            await snipeToken(pairAddress, tokenAddress); 
+        } finally {
+            // حرر القفل بعد 5 ثوانٍ للسماح للحارس بالبدء
+            setTimeout(() => { isWiseHawkHunting = false; }, 5000);
+        }
     } else {
         logger.warn(`🔻 [مهمة منتهية] تم تجاهل ${tokenAddress} (السبب: ${checkResult.reason}).`);
         if (config.DEBUG_MODE) {
@@ -483,7 +536,7 @@ async function processNewTarget(pair) {
 }
 
 async function pollForMomentum() {
-    logger.info("🚀 [راصد الزخم] بدأ تشغيل البوت (v9.1).");
+    logger.info("🚀 [الصقر الحكيم] بدأ تشغيل البوت (v9.2).");
     while (true) {
         try {
             const pairs = await fetchTrendingPairs();
@@ -498,10 +551,10 @@ async function pollForMomentum() {
                 }
             }
         } catch (error) {
-            logger.error(`❌ خطأ في حلقة "راصد الزخم" الرئيسية: ${error.message}`);
+            logger.error(`❌ خطأ في حلقة "الصقر الحكيم" الرئيسية: ${error.message}`);
         }
         
-        logger.info(`[راصد الزخم] اكتمل البحث. في انتظار 10 دقائق (حتى ${new Date(Date.now() + 10 * 60 * 1000).toLocaleTimeString()})...`);
+        logger.info(`[الصقر الحكيم] اكتمل البحث. في انتظار 10 دقائق (حتى ${new Date(Date.now() + 10 * 60 * 1000).toLocaleTimeString()})...`);
         await sleep(10 * 60 * 1000); // 10 دقائق
     }
 }
@@ -510,7 +563,7 @@ async function pollForMomentum() {
 // 7. الدالة الرئيسية (Main)
 // =================================================================
 async function main() {
-    logger.info(`--- بدء تشغيل بوت صياد الدرر (v9.1 - راصد الزخم) ---`);
+    logger.info(`--- بدء تشغيل بوت صياد الدرر (v9.2 - الصقر الحكيم) ---`);
     try {
         provider = new ethers.JsonRpcProvider(config.PROTECTED_RPC_URL);
         wallet = new ethers.Wallet(config.PRIVATE_KEY, provider);
@@ -519,7 +572,7 @@ async function main() {
         logger.info(`💾 تم تحميل ${activeTrades.length} صفقة نشطة من الملف.`);
         const network = await provider.getNetwork();
         logger.info(`✅ تم الاتصال بالشبكة (RPC) بنجاح! (${network.name}, ChainID: ${network.chainId})`);
-        const welcomeMsg = `✅ <b>تم تشغيل بوت راصد الزخم (v9.1 JS) بنجاح!</b>`;
+        const welcomeMsg = `✅ <b>تم تشغيل بوت الصقر الحكيم (v9.2 JS) بنجاح!</b>`;
         telegram.sendMessage(config.TELEGRAM_ADMIN_CHAT_ID, welcomeMsg, { parse_mode: 'HTML', reply_markup: getMainMenuKeyboard() });
 
         telegram.on('message', (msg) => {
@@ -579,6 +632,8 @@ async function main() {
                     if (fs.existsSync(TRADES_FILE)) {
                         fs.unlinkSync(TRADES_FILE); // 2. حذف الملف
                     }
+                    // <<< [تطوير v9.2] تحرير قفل الصقر عند التصفير >>>
+                    isWiseHawkHunting = false;
                     logger.info("🔄 تم تصفير البيانات بنجاح (حذف الصفقات النشطة والملف).");
                     telegram.editMessageText("✅ تم تصفير جميع الصفقات النشطة بنجاح.", { chat_id: chatId, message_id: query.message.message_id });
                 } catch (error) {
@@ -650,7 +705,7 @@ async function main() {
 }
 
 // =================================================================
-// 8. دوال واجهة التليجرام (Telegram UI) - [تطوير v9.1]
+// 8. دوال واجهة التليجرام (Telegram UI) - (لا تغيير كبير)
 // =================================================================
 
 function getMainMenuKeyboard() {
@@ -669,9 +724,10 @@ function getMainMenuKeyboard() {
 
 // <<< [تطوير v9.1] تحويل الدالة إلى async لجلب الأرصدة >>>
 async function showStatus(chatId) {
-    let statusText = "<b>📊 الحالة الحالية للبوت (v9.1 - راصد الزخم):</b>\n\n";
+    let statusText = "<b>📊 الحالة الحالية للبوت (v9.2 - الصقر الحكيم):</b>\n\n";
     statusText += `<b>حالة البحث:</b> ${config.IS_PAUSED ? 'موقوف مؤقتاً ⏸️' : 'نشط ▶️'}\n`;
     statusText += `<b>وضع التصحيح:</b> ${config.DEBUG_MODE ? 'فعّال 🟢' : 'غير فعّال ⚪️'}\n`;
+    statusText += `<b>حالة الصقر:</b> ${isWiseHawkHunting ? 'يصطاد 🦅' : 'جاهز للصيد'}\n`; // <<< [تطوير v9.2]
     statusText += "-----------------------------------\n";
 
     // --- جلب رصيد BNB ---
