@@ -1,5 +1,5 @@
 // =================================================================
-// صياد الدرر: v3.1 (قناص شفاف - لوحة تحكم المحفظة)
+// صياد الدرر: v3.1.1 (إصلاح حاسم لـ TSL والحارس)
 // =================================================================
 import { ethers } from 'ethers';
 import dotenv from 'dotenv';
@@ -34,7 +34,6 @@ const config = {
     ROUTER_ADDRESS: '0x10ED43C718714eb63d5aA57B78B54704E256024E',
     FACTORY_ADDRESS: '0xcA143Ce32Fe78f1f7019d7d551a6402fC5350c73',
     WBNB_ADDRESS: "0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c",
-    // <<< [تطوير v3.1] إضافة عقد BUSD لحساب القيمة بالدولار
     BUSD_ADDRESS: "0xe9e7CEA3DedcA5984780Bafc599bD69ADd087D56",
     BUY_AMOUNT_BNB: parseFloat(process.env.BUY_AMOUNT_BNB || '0.01'),
     GAS_PRIORITY_MULTIPLIER: parseInt(process.env.GAS_PRIORITY_MULTIPLIER || '2', 10),
@@ -186,8 +185,12 @@ async function snipeToken(pairAddress, tokenAddress) {
         if (receipt.status === 1) {
             logger.info(`💰 نجحت عملية الشراء! تم قنص ${tokenAddress}.`);
             const tokenContract = new ethers.Contract(tokenAddress, ERC20_ABI, wallet);
+            
+            // <<< [إصلاح v3.1.1] جلب الـ decimals كـ BigInt
             const decimals = await tokenContract.decimals();
-            const buyPrice = config.BUY_AMOUNT_BNB / parseFloat(ethers.formatUnits(amountsOut[1], decimals));
+            // <<< نهاية الإصلاح
+            
+            const buyPrice = config.BUY_AMOUNT_BNB / parseFloat(ethers.formatUnits(amountsOut[1], Number(decimals))); // تحويل لـ Number هنا
             const msg = `💰 <b>نجحت عملية الشراء!</b> 💰\n\n<b>العملة:</b> <code>${tokenAddress}</code>\n<b>رابط المعاملة:</b> <a href='https://bscscan.com/tx/${tx.hash}'>BscScan</a>\n<b>📊 رابط الشارت:</b> <a href='https://dexscreener.com/bsc/${pairAddress}'>DexScreener</a>`;
             telegram.sendMessage(config.TELEGRAM_ADMIN_CHAT_ID, msg, { parse_mode: 'HTML' });
             
@@ -197,7 +200,7 @@ async function snipeToken(pairAddress, tokenAddress) {
                 buyPrice, 
                 initialAmountWei: amountsOut[1], 
                 remainingAmountWei: amountsOut[1], 
-                decimals, 
+                decimals: decimals, // <<< [إصلاح v3.1.1] تخزينها كـ BigInt (كما تأتي)
                 currentProfit: 0, 
                 highestProfit: 0,
                 partialTpTaken: false 
@@ -234,14 +237,19 @@ async function approveMax(tokenAddress) {
 }
 
 // =================================================================
-// 3. الحارس (Guardian)
+// 3. الحارس (Guardian) - [إصلاح v3.1.1]
 // =================================================================
 async function monitorTrades() {
     if (activeTrades.length === 0) return;
 
     const priceChecks = activeTrades.map(trade => {
         const path = [trade.tokenAddress, config.WBNB_ADDRESS];
-        const oneToken = ethers.parseUnits("1", trade.decimals);
+        
+        // <<< [إصلاح v3.1.1] تحويل الـ decimals إلى Number هنا
+        // هذا هو السطر الذي كان يسبب تعطل الحارس
+        const oneToken = ethers.parseUnits("1", Number(trade.decimals)); 
+        // <<< نهاية الإصلاح
+        
         return routerContract.getAmountsOut.staticCall(oneToken, path);
     });
 
@@ -318,7 +326,10 @@ async function monitorTrades() {
                  logger.error(`[مراقبة] خطأ في معالجة سعر ${trade.tokenAddress}: ${processingError.message}`);
             }
         } else {
-            if (result.reason.code === 'CALL_EXCEPTION') {
+            // [إصلاح v3.1.1] فحص سبب الرفض
+            if (result.reason.code === 'INVALID_ARGUMENT') {
+                 logger.error(`[مراقبة] 🚨 خطأ برمجي في جلب سعر ${trade.tokenAddress}: ${result.reason.message || result.reason}`);
+            } else if (result.reason.code === 'CALL_EXCEPTION') {
                  logger.warn(`[مراقبة] قد تكون الصفقة ${trade.tokenAddress} مغلقة. خطأ: ${result.reason.reason}`);
             } else {
                  logger.error(`[مراقبة] خطأ في جلب سعر ${trade.tokenAddress}: ${result.reason.message || result.reason}`);
@@ -333,7 +344,7 @@ async function executeSell(trade, amountToSellWei, reason = "يدوي") {
          return false; 
     }
     try {
-        logger.info(`💸 [بيع] بدء عملية بيع ${reason} لـ ${trade.tokenAddress}... الكمية: ${ethers.formatUnits(amountToSellWei, trade.decimals)}`);
+        logger.info(`💸 [بيع] بدء عملية بيع ${reason} لـ ${trade.tokenAddress}... الكمية: ${ethers.formatUnits(amountToSellWei, Number(trade.decimals))}`); // [إصلاح v3.1.1] تحويل لـ Number
         const path = [trade.tokenAddress, config.WBNB_ADDRESS];
         const feeData = await provider.getFeeData();
         const txOptions = { gasLimit: config.GAS_LIMIT };
@@ -371,7 +382,9 @@ function replacer(key, value) {
   return value;
 }
 function reviver(key, value) {
+  // [إصلاح v3.1.1] تعديل شامل للتعامل مع decimals كـ BigInt أو Number
   if (key && key.endsWith('Wei') && typeof value === 'string') { try { return BigInt(value); } catch(e) {} }
+  if (key === 'decimals' && typeof value === 'string') { try { return BigInt(value); } catch(e) {} } // decimals قد تكون مخزنة كنص
   return value;
 }
 function saveTradesToFile() {
@@ -393,6 +406,8 @@ function loadTradesFromFile() {
                     .filter(t => t.tokenAddress && t.remainingAmountWei)
                     .map(t => ({
                         ...t,
+                        // [إصلاح v3.1.1] التأكد من تحويل decimals المخزنة قديماً (كـ number) إلى BigInt
+                        decimals: t.decimals ? BigInt(t.decimals.toString()) : 18n, // افتراضي 18 إذا كانت مفقودة
                         partialTpTaken: t.partialTpTaken || false 
                     }));
                  activeTrades.push(...validTrades);
@@ -476,7 +491,7 @@ async function handlePairCreated(token0, token1, pairAddress) {
 }
 
 async function main() {
-    logger.info(`--- بدء تشغيل بوت صياد الدرر (v3.1 JS) ---`); // [تطوير v3.1]
+    logger.info(`--- بدء تشغيل بوت صياد الدرر (v3.1.1 JS) ---`); // [إصلاح v3.1.1]
     try {
         provider = new ethers.JsonRpcProvider(config.PROTECTED_RPC_URL);
         wallet = new ethers.Wallet(config.PRIVATE_KEY, provider);
@@ -485,7 +500,7 @@ async function main() {
         logger.info(`💾 تم تحميل ${activeTrades.length} صفقة نشطة من الملف.`);
         const network = await provider.getNetwork();
         logger.info(`✅ تم الاتصال بالشبكة (RPC) بنجاح! (${network.name}, ChainID: ${network.chainId})`);
-        const welcomeMsg = `✅ <b>تم تشغيل بوت صياد الدرر (v3.1 JS) بنجاح!</b>`; // [تطوير v3.1]
+        const welcomeMsg = `✅ <b>تم تشغيل بوت صياد الدرر (v3.1.1 JS) بنجاح!</b>`; // [إصلاح v3.1.1]
         telegram.sendMessage(config.TELEGRAM_ADMIN_CHAT_ID, welcomeMsg, { parse_mode: 'HTML', reply_markup: getMainMenuKeyboard() });
 
         telegram.on('message', (msg) => {
@@ -517,7 +532,6 @@ async function main() {
                 }
                 return;
             }
-            // <<< [تطوير v3.1] إضافة معالج الزر الجديد
             switch (msg.text) {
                 case '⏸️ إيقاف القنص': case '▶️ استئناف القنص':
                     config.IS_PAUSED = !config.IS_PAUSED;
@@ -528,7 +542,7 @@ async function main() {
                     telegram.sendMessage(chatId, `ℹ️ وضع التصحيح الآن: <b>${config.DEBUG_MODE ? "فعّال 🟢" : "غير فعّال ⚪️"}</b>`, { parse_mode: 'HTML', reply_markup: getMainMenuKeyboard() });
                     break;
                 case '📊 الحالة': showStatus(chatId); break;
-                case '💰 عرض المحفظة': showPortfolioStatus(chatId); break; // <-- جديد
+                case '💰 عرض المحفظة': showPortfolioStatus(chatId); break; 
                 case '🔬 التشخيص': showDiagnostics(chatId); break;
                 case '⚙️ الإعدادات': showSettingsMenu(chatId); break;
                 case '💰 بيع يدوي': showManualSellMenu(chatId); break;
@@ -598,28 +612,25 @@ async function main() {
 
 // --- دوال واجهة التليجرام الكاملة ---
 
-// <<< [تطوير v3.1] دالة مساعدة لجلب سعر BNB
 async function getBNBPriceUSD() {
     try {
         const oneBNB = ethers.parseEther("1");
         const path = [config.WBNB_ADDRESS, config.BUSD_ADDRESS];
-        // نستخدم staticCall لأنه آمن ولا يستهلك غاز
         const amountsOut = await routerContract.getAmountsOut.staticCall(oneBNB, path);
-        return parseFloat(ethers.formatUnits(amountsOut[1], 18)); // BUSD has 18 decimals
+        return parseFloat(ethers.formatUnits(amountsOut[1], 18)); 
     } catch (error) {
         logger.error(`[سعر] 🚨 فشل جلب سعر BNB: ${error.message}`);
-        return 0; // إرجاع صفر إذا فشل جلب السعر
+        return 0; 
     }
 }
 
-// <<< [تطوير v3.1] لوحة تحكم المحفظة الجديدة
+// [إصلاح v3.1.1]
 async function showPortfolioStatus(chatId) {
     await telegram.sendMessage(chatId, "⏳ جارٍ حساب قيمة المحفظة بالكامل... يرجى الانتظار.", { parse_mode: 'HTML' });
 
     let totalPortfolioValueUSD = 0;
     let reportText = "<b>💰 لوحة تحكم المحفظة الاحترافية 💰</b>\n\n";
 
-    // --- 1. حساب رصيد الـ BNB (الكاش) ---
     const bnbPrice = await getBNBPriceUSD();
     if (bnbPrice === 0) {
          telegram.sendMessage(chatId, "❌ فشل جلب سعر BNB، لا يمكن حساب قيمة المحفظة.");
@@ -641,22 +652,25 @@ async function showPortfolioStatus(chatId) {
     if (activeTrades.length === 0) {
         reportText += "ℹ️ لا توجد صفقات نشطة حالياً.\n";
     } else {
-        // --- 2. حساب قيمة العملات النشطة (بالتوازي) ---
         const tokenValuePromises = activeTrades.map(async (trade) => {
             if (trade.remainingAmountWei <= 0n) {
                 return { name: trade.tokenAddress.slice(-6), value: 0, amount: 0 };
             }
             try {
-                // جلب قيمة العملة بالـ BNB
                 const path = [trade.tokenAddress, config.WBNB_ADDRESS];
                 const amountsOut = await routerContract.getAmountsOut.staticCall(trade.remainingAmountWei, path);
                 const bnbValue = parseFloat(ethers.formatEther(amountsOut[1]));
-                const tokenUSDValue = bnbValue * bnbPrice; // نستخدم سعر BNB الذي جلبناه
-                const tokenAmount = parseFloat(ethers.formatUnits(trade.remainingAmountWei, trade.decimals));
+                const tokenUSDValue = bnbValue * bnbPrice; 
+                
+                // <<< [إصلاح v3.1.1] تحويل الـ decimals إلى Number هنا
+                const tokenAmount = parseFloat(ethers.formatUnits(trade.remainingAmountWei, Number(trade.decimals)));
+                // <<< نهاية الإصلاح
+                
                 return { name: trade.tokenAddress.slice(-6), value: tokenUSDValue, amount: tokenAmount };
             } catch (error) {
+                // [إصلاح v3.1.1] تسجيل الخطأ الحقيقي
                 logger.error(`[محفظة] فشل جلب سعر ${trade.tokenAddress}: ${error.message}`);
-                return { name: trade.tokenAddress.slice(-6), value: 0, amount: 0 }; // فشل = 0
+                return { name: trade.tokenAddress.slice(-6), value: 0, amount: 0 }; 
             }
         });
 
@@ -667,8 +681,11 @@ async function showPortfolioStatus(chatId) {
                 const { name, value, amount } = result.value;
                 reportText += `- <code>...${name}</code>: $${value.toFixed(2)} (كمية: ${amount.toFixed(2)})\n`;
                 totalTokensValueUSD += value;
-            } else if (result.status === 'rejected') {
-                reportText += `- <code>...????</code>: $0.00 (خطأ في الحساب)\n`;
+            } else if (result.status === 'rejected' || (result.status === 'fulfilled' && result.value.value === 0)) {
+                // التعامل مع الأخطاء أو القيم الصفرية
+                let tokenName = "...????";
+                if(result.status === 'fulfilled') tokenName = `...${result.value.name}`;
+                reportText += `- <code>${tokenName}</code>: $0.00 (خطأ في الحساب أو القيمة صفر)\n`;
             }
         });
 
@@ -679,12 +696,10 @@ async function showPortfolioStatus(chatId) {
     
     totalPortfolioValueUSD += totalTokensValueUSD;
 
-    // --- 3. التقرير النهائي ---
     reportText += "-----------------------------------\n";
     reportText += `<b>📊 إجمالي قيمة المحفظة ≈ $${totalPortfolioValueUSD.toFixed(2)}</b>\n\n`;
 
-    // 4. حساب النسب (كما طلب المستخدم)
-    if (totalPortfolioValueUSD > 0.01) { // لتجنب القسمة على صفر
+    if (totalPortfolioValueUSD > 0.01) { 
          const bnbPercent = (bnbBalanceUSD / totalPortfolioValueUSD) * 100;
          const tokensPercent = (totalTokensValueUSD / totalPortfolioValueUSD) * 100;
          reportText += `<b>التوزيع:</b> ${bnbPercent.toFixed(0)}% كاش (BNB), ${tokensPercent.toFixed(0)}% عملات (Tokens)\n`;
@@ -694,13 +709,12 @@ async function showPortfolioStatus(chatId) {
 }
 
 
-// <<< [تطوير v3.1] تحديث لوحة المفاتيح
 function getMainMenuKeyboard() {
     const pauseButtonText = config.IS_PAUSED ? "▶️ استئناف القنص" : "⏸️ إيقاف القنص";
     const debugButtonText = config.DEBUG_MODE ? "⚪️ إيقاف التصحيح" : "🟢 تفعيل التصحيح";
     return {
         keyboard: [
-            [{ text: "📊 الحالة" }, { text: "💰 عرض المحفظة" }], // <-- جديد
+            [{ text: "📊 الحالة" }, { text: "💰 عرض المحفظة" }], 
             [{ text: "💰 بيع يدوي" }, { text: "🔬 التشخيص" }],
             [{ text: "⚙️ الإعدادات" }, { text: pauseButtonText }],
             [{ text: debugButtonText }]
@@ -727,7 +741,7 @@ function showStatus(chatId) {
         });
     }
     statusText += "-----------------------------------\n";
-    statusText += "<b>⚙️ إعدادات التداول (v3.1 - شفاف):</b>\n";
+    statusText += "<b>⚙️ إعدادات التداول (v3.1.1 - إصلاح):</b>\n";
     statusText += `- مبلغ الشراء: ${config.BUY_AMOUNT_BNB} BNB\n`;
     statusText += `- مضاعف الغاز: ${config.GAS_PRIORITY_MULTIPLIER}x\n`;
     statusText += `- حد السيولة: ${config.MINIMUM_LIQUIDITY_BNB} BNB\n`;
