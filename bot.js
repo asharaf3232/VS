@@ -1,5 +1,5 @@
 // =================================================================
-// صياد الدرر: v9.7 (راصد الزخم الآمن - إصلاح Syntax Error + تحسينات)
+// صياد الدرر: v9.9-Fixed (إصلاح تحديد العملة + إصلاح حساب العمر)
 // =================================================================
 import { ethers } from 'ethers';
 import dotenv from 'dotenv';
@@ -148,7 +148,7 @@ async function fullCheck(pairAddress, tokenAddress) {
         const amountIn = ethers.parseUnits("1", decimals);
         await routerContract.getAmountsOut.staticCall(amountIn, [tokenAddress, config.WBNB_ADDRESS]);
         logger.info(` -> ✅ فحص شامل ناجح.`);
-        return { passed: true, reason: "اجتاز الفحص الشامل (v9.7)" };
+        return { passed: true, reason: "اجتاز الفحص الشامل (v9.9)" };
     } catch (error) {
         const isHoneypot = error.message.includes('INSUFFICIENT_OUTPUT_AMOUNT') || error.message.includes('TRANSFER_FROM_FAILED') || error.code === 'CALL_EXCEPTION';
         const reason = isHoneypot ? `فخ عسل (محاكاة فشلت)` : `فشل فحص غير متوقع`;
@@ -248,10 +248,10 @@ function removeTrade(tradeToRemove) { const i = activeTrades.findIndex(t => t.to
 
 
 // =================================================================
-// 6. الراصد ونقطة الانطلاق (v9.7 "راصد الزخم الآمن - فلترة محسنة")
+// 6. الراصد ونقطة الانطلاق (v9.9-Fixed)
 // =================================================================
 /**
- * جلب وفلترة العملات الجديدة من DexScreener (v9.9 المصححة - إصلاح نهائي لحساب العمر)
+ * جلب وفلترة العملات الجديدة من DexScreener (v9.9-Fixed)
  */
 async function fetchTrendingPairs() {
     if (config.IS_PAUSED) { logger.info('🛑 البوت متوقف.'); return []; }
@@ -263,25 +263,37 @@ async function fetchTrendingPairs() {
         if (response.data && response.data.pairs) {
             const allPairs = response.data.pairs;
             const filteredPairs = allPairs.filter(pair => {
-                if (!pair || !pair.pairCreatedAt || !pair.chainId || pair.chainId !== 'bsc' || !pair.baseToken || !pair.baseToken.address) return false;
+                // فحص أولي لوجود البيانات الأساسية
+                if (!pair || !pair.pairCreatedAt || !pair.chainId || pair.chainId !== 'bsc' || !pair.baseToken || !pair.baseToken.address || !pair.quoteToken || !pair.quoteToken.address) return false;
 
-                const tokenAddress = pair.baseToken.address;
+                // --- بداية الإصلاح: تحديد العملة الصحيحة (ليست WBNB) ---
+                let tokenAddress;
+                let tokenSymbol;
+                const wbnbAddressLower = config.WBNB_ADDRESS.toLowerCase();
 
-                // ===== <<< إصلاح v9.9: pairCreatedAt هي مللي ثانية بالفعل >>> =====
+                if (pair.baseToken.address.toLowerCase() === wbnbAddressLower) {
+                    tokenAddress = pair.quoteToken.address;
+                    tokenSymbol = pair.quoteToken.symbol;
+                } else if (pair.quoteToken.address.toLowerCase() === wbnbAddressLower) {
+                    tokenAddress = pair.baseToken.address;
+                    tokenSymbol = pair.baseToken.symbol;
+                } else {
+                    return false; // ليس زوج WBNB
+                }
+                // --- نهاية الإصلاح ---
+
+                // تأكد أن العملة ليست WBNB نفسها (مهم جداً)
+                if (tokenAddress.toLowerCase() === wbnbAddressLower) return false;
+
+                // ===== pairCreatedAt هي مللي ثانية بالفعل (v9.9) =====
                 let createdAtMs;
                 if (typeof pair.pairCreatedAt === 'number') {
                     createdAtMs = pair.pairCreatedAt; // استخدم القيمة مباشرة
                 } else if (typeof pair.pairCreatedAt === 'string') {
-                    try { // محاولة تحويل النص إلى رقم (مللي ثانية)
-                        createdAtMs = parseInt(pair.pairCreatedAt, 10);
-                        if (isNaN(createdAtMs)) throw new Error('Invalid timestamp string');
-                    } catch (e) {
-                        logger.error(`[خطأ عمر] فشل تحويل pairCreatedAt النصي: ${pair.pairCreatedAt} لـ ${tokenAddress.slice(0,10)}`);
-                        return false;
-                    }
+                    try { createdAtMs = parseInt(pair.pairCreatedAt, 10); if (isNaN(createdAtMs)) throw new Error('Invalid timestamp string'); }
+                    catch (e) { logger.error(`[خطأ عمر] فشل تحويل pairCreatedAt النصي: ${pair.pairCreatedAt} لـ ${tokenAddress.slice(0,10)}`); return false; }
                 } else {
-                    logger.error(`[خطأ عمر] نوع pairCreatedAt غير متوقع: ${typeof pair.pairCreatedAt} لـ ${tokenAddress.slice(0,10)}`);
-                    return false;
+                    logger.error(`[خطأ عمر] نوع pairCreatedAt غير متوقع: ${typeof pair.pairCreatedAt} لـ ${tokenAddress.slice(0,10)}`); return false;
                 }
 
                 // حساب العمر الصحيح الآن
@@ -291,26 +303,26 @@ async function fetchTrendingPairs() {
 
                 // فلتر العمر
                 if (ageMinutes < config.MIN_AGE_MINUTES || ageMinutes > (config.MAX_AGE_HOURS * 60)) {
-                    if (config.DEBUG_MODE) logger.info(`[فلتر] رفض ${tokenAddress.slice(0,10)}: عمر ${ageMinutes.toFixed(1)} د`);
+                    if (config.DEBUG_MODE) logger.info(`[فلتر] رفض ${tokenSymbol || tokenAddress.slice(0,10)}: عمر ${ageMinutes.toFixed(1)} د`);
                     return false;
                 }
                 // فلتر السيولة
                 const liquidityUsd = pair.liquidity?.usd || 0;
                 if (liquidityUsd < config.MIN_LIQUIDITY_USD) {
-                    if (config.DEBUG_MODE) logger.info(`[فلتر] رفض ${tokenAddress.slice(0,10)}: سيولة $${liquidityUsd.toFixed(0)}`);
+                    if (config.DEBUG_MODE) logger.info(`[فلتر] رفض ${tokenSymbol || tokenAddress.slice(0,10)}: سيولة $${liquidityUsd.toFixed(0)}`);
                     return false;
                 }
                 // فلتر الحجم
                 const volumeH1 = pair.volume?.h1 || 0;
                 if (volumeH1 < config.MIN_VOLUME_H1) {
-                    if (config.DEBUG_MODE) logger.info(`[فلتر] رفض ${tokenAddress.slice(0,10)}: حجم $${volumeH1.toFixed(0)}/س`);
+                    if (config.DEBUG_MODE) logger.info(`[فلتر] رفض ${tokenSymbol || tokenAddress.slice(0,10)}: حجم $${volumeH1.toFixed(0)}/س`);
                     return false;
                 }
                 // فلتر المعاملات
                 const txnsH1 = pair.txns?.h1 || {};
                 const totalTxns = (txnsH1.buys || 0) + (txnsH1.sells || 0);
                 if (totalTxns < config.MIN_TXNS_H1) {
-                    if (config.DEBUG_MODE) logger.info(`[فلتر] رفض ${tokenAddress.slice(0,10)}: معاملات ${totalTxns}/س`);
+                    if (config.DEBUG_MODE) logger.info(`[فلتر] رفض ${tokenSymbol || tokenAddress.slice(0,10)}: معاملات ${totalTxns}/س`);
                     return false;
                 }
                 return true;
@@ -324,30 +336,69 @@ async function fetchTrendingPairs() {
         lastPairsFound = 0; logger.warn(`⚠️ لم يتم العثور على أزواج WBNB.`); return [];
     } catch (error) { logger.error(`❌ خطأ DexScreener: ${error.message}`); lastPairsFound = 0; return []; }
 }
+
+/**
+ * معالجة الهدف (v9.9-Fixed)
+ */
 async function processNewTarget(pair) {
-    if (!pair || !pair.pairAddress || !pair.baseToken || !pair.baseToken.address) return;
-    const pairAddress = pair.pairAddress; const tokenAddress = pair.baseToken.address;
-    if (processedPairs.has(pairAddress)) return; processedPairs.add(pairAddress);
+    if (!pair || !pair.pairAddress || !pair.baseToken || !pair.baseToken.address || !pair.quoteToken || !pair.quoteToken.address) return;
 
-    const liquidityUsd = pair.liquidity?.usd || 0; const volumeH1 = pair.volume?.h1 || 0; const txnsH1 = pair.txns?.h1 || {}; const totalTxns = (txnsH1.buys || 0) + (txnsH1.sells || 0); const ageMinutes = (Date.now() - (pair.pairCreatedAt * 1000)) / (1000 * 60);
+    const wbnbAddressLower = config.WBNB_ADDRESS.toLowerCase();
 
-    logger.info(`\n🎯 مرشح! ${pair.baseToken.symbol} (${tokenAddress.slice(0, 10)}...)`);
+    // --- بداية الإصلاح 1: تحديد العملة الصحيحة ---
+    let tokenAddress;
+    let tokenSymbol;
+    if (pair.baseToken.address.toLowerCase() === wbnbAddressLower) {
+        tokenAddress = pair.quoteToken.address;
+        tokenSymbol = pair.quoteToken.symbol;
+    } else if (pair.quoteToken.address.toLowerCase() === wbnbAddressLower) {
+        tokenAddress = pair.baseToken.address;
+        tokenSymbol = pair.baseToken.symbol;
+    } else {
+        return; // ليس زوج WBNB
+    }
+    // --- نهاية الإصلاح 1 ---
+
+    const pairAddress = pair.pairAddress;
+    // التأكد من عدم المعالجة السابقة أو أن العملة هي WBNB
+    if (processedPairs.has(pairAddress) || tokenAddress.toLowerCase() === wbnbAddressLower) return;
+    processedPairs.add(pairAddress);
+
+    const liquidityUsd = pair.liquidity?.usd || 0;
+    const volumeH1 = pair.volume?.h1 || 0;
+    const txnsH1 = pair.txns?.h1 || {};
+    const totalTxns = (txnsH1.buys || 0) + (txnsH1.sells || 0);
+
+    // --- بداية الإصلاح 2: حساب العمر (إزالة * 1000) ---
+    // pair.pairCreatedAt هي مللي ثانية
+    const ageMinutes = (Date.now() - pair.pairCreatedAt) / (1000 * 60);
+    // --- نهاية الإصلاح 2 ---
+
+    // --- بداية الإصلاح 3: استخدام الرمز والاسم الصحيح ---
+    logger.info(`\n🎯 مرشح! ${tokenSymbol} (${tokenAddress.slice(0, 10)}...)`);
     logger.info(`   ${ageMinutes.toFixed(1)}د | $${liquidityUsd.toFixed(0)} | ${volumeH1.toFixed(0)}/س | ${totalTxns}/س | 🔗 https://dexscreener.com/bsc/${pairAddress}`);
 
     const checkResult = await fullCheck(pairAddress, tokenAddress);
     if (checkResult.passed) {
         if (isWiseHawkHunting) { logger.info(`⏳ ${tokenAddress.slice(0,10)} ينتظر.`); processedPairs.delete(pairAddress); return; }
         isWiseHawkHunting = true;
-        await telegram.sendMessage(config.TELEGRAM_ADMIN_CHAT_ID, `<b>🚀 فرصة! ${pair.baseToken.symbol}</b>\n<code>${tokenAddress}</code>\n(${ageMinutes.toFixed(0)}د | $${liquidityUsd.toFixed(0)} | ${volumeH1.toFixed(0)}/س | ${totalTxns}/س)\n✅ اجتاز الدرع.\n⏳ شراء...`, { parse_mode: 'HTML' });
-        try { await snipeToken(pairAddress, tokenAddress); } catch (e) { logger.error(`Error snipeToken: ${e}`); isWiseHawkHunting = false; }
+        await telegram.sendMessage(config.TELEGRAM_ADMIN_CHAT_ID, `<b>🚀 فرصة! ${tokenSymbol}</b>\n<code>${tokenAddress}</code>\n(${ageMinutes.toFixed(0)}د | $${liquidityUsd.toFixed(0)} | ${volumeH1.toFixed(0)}/س | ${totalTxns}/س)\n✅ اجتاز الدرع.\n⏳ شراء...`, { parse_mode: 'HTML' });
+        try {
+            await snipeToken(pairAddress, tokenAddress);
+        } catch (e) {
+            logger.error(`Error snipeToken: ${e}`);
+            isWiseHawkHunting = false;
+        }
     } else {
         logger.warn(`❌ ${tokenAddress.slice(0,10)} - ${checkResult.reason}.`);
         if (config.DEBUG_MODE) await telegram.sendMessage(config.TELEGRAM_ADMIN_CHAT_ID, `<b>❌ مرفوض</b>\n<code>${tokenAddress}</code>\n<b>السبب:</b> ${checkResult.reason}`, { parse_mode: 'HTML' });
     }
+    // --- نهاية الإصلاح 3 ---
 }
 
+
 async function pollForMomentum() {
-    logger.info("🚀 [راصد الزخم الآمن] بدأ (v9.7).");
+    logger.info("🚀 [راصد الزخم الآمن] بدأ (v9.9-Fixed).");
     while (true) {
         try {
             const pairs = await fetchTrendingPairs();
@@ -364,14 +415,14 @@ async function pollForMomentum() {
 // 7. الدالة الرئيسية (Main)
 // =================================================================
 async function main() {
-    logger.info(`--- بدء تشغيل (v9.7 - فلترة محسنة وإصلاحات) ---`);
+    logger.info(`--- بدء تشغيل (v9.9-Fixed) ---`);
     try {
         provider = new ethers.JsonRpcProvider(config.PROTECTED_RPC_URL);
         wallet = new ethers.Wallet(config.PRIVATE_KEY, provider);
         routerContract = new ethers.Contract(config.ROUTER_ADDRESS, ROUTER_ABI, wallet);
         loadTradesFromFile(); logger.info(`💾 ${activeTrades.length} صفقة محملة.`);
         const network = await provider.getNetwork(); logger.info(`✅ متصل بـ (${network.name}, ID: ${network.chainId})`);
-        const welcomeMsg = `✅ <b>راصد الزخم الآمن (v9.7) بدأ!</b>`;
+        const welcomeMsg = `✅ <b>راصد الزخم الآمن (v9.9-Fixed) بدأ!</b>`;
         await telegram.sendMessage(config.TELEGRAM_ADMIN_CHAT_ID, welcomeMsg, { parse_mode: 'HTML', reply_markup: getMainMenuKeyboard() });
 
         telegram.on('message', async (msg) => {
@@ -410,7 +461,7 @@ async function main() {
 }
 
 // =================================================================
-// 8. دوال واجهة التليجرام (Telegram UI) - [النسخ الكاملة والمحدثة]
+// 8. دوال واجهة التليجرام (Telegram UI)
 // =================================================================
 function getMainMenuKeyboard() {
     const pauseButtonText = config.IS_PAUSED ? "▶️ استئناف البحث" : "⏸️ إيقاف البحث";
@@ -427,7 +478,7 @@ function getMainMenuKeyboard() {
 }
 
 async function showStatus(chatId) {
-    let statusText = `<b>📊 الحالة (v9.7):</b>\n\n`; // تحديث الإصدار
+    let statusText = `<b>📊 الحالة (v9.9-Fixed):</b>\n\n`; // تحديث الإصدار
     statusText += `<b>البحث:</b> ${config.IS_PAUSED ? 'موقوف⏸️' : 'نشط▶️'} | <b>تصحيح:</b> ${config.DEBUG_MODE ? 'فعّال🟢' : 'OFF⚪️'}\n`;
     statusText += `<b>شراء:</b> ${isWiseHawkHunting ? 'مشغول🦅' : 'جاهز'} | <b>أهداف:${lastPairsFound}</b>\n-----------------------------------\n`;
     let bnbBalance = 0; try { bnbBalance = parseFloat(ethers.formatEther(await provider.getBalance(config.WALLET_ADDRESS))); } catch (e) { logger.error(`[Status] خطأ رصيد BNB: ${e.message}`); }
@@ -436,7 +487,6 @@ async function showStatus(chatId) {
         statusText += "ℹ️ لا توجد صفقات نشطة.\n";
     } else {
         statusText += "<b>📈 الصفقات النشطة:</b>\n";
-        // جلب الأرصدة (اختياري، يمكن إضافته لاحقًا إذا لزم الأمر)
         activeTrades.forEach(trade => {
             statusText += `•<code>${trade.tokenAddress.slice(0, 10)}..</code>(${trade.currentProfit.toFixed(1)}%)${trade.partialTpTaken ? '(✅TP جزئي)' : ''}\n`;
         });
@@ -471,22 +521,15 @@ function showDiagnostics(chatId) {
 
 function showSettingsMenu(chatId) {
     const keyboard = [
-        // الصف الأول: الشراء والغاز
         [{ text: `💵 شراء (${config.BUY_AMOUNT_BNB})`, callback_data: 'change_BUY_AMOUNT_BNB' }, { text: `🚀 غاز (${config.GAS_PRIORITY_MULTIPLIER}x)`, callback_data: 'change_GAS_PRIORITY_MULTIPLIER' }],
-        // الصف الثاني: الانزلاق وسيولة BNB (للفحص الأمني)
         [{ text: `📊 انزلاق (${config.SLIPPAGE_LIMIT}%)`, callback_data: 'change_SLIPPAGE_LIMIT' }, { text: `💧 سيولة BNB (${config.MINIMUM_LIQUIDITY_BNB})`, callback_data: 'change_MINIMUM_LIQUIDITY_BNB' }],
-        // الصف الثالث: وقف الخسارة المتحرك
         [{ text: `📈 وقف متحرك (${config.TRAILING_STOP_LOSS_PERCENT}%)`, callback_data: 'change_TRAILING_STOP_LOSS_PERCENT' }],
-        // الصف الرابع: جني الأرباح الجزئي
         [{ text: `🎯 TP هدف (${config.PARTIAL_TP_PERCENT}%)`, callback_data: 'change_PARTIAL_TP_PERCENT' }, { text: `💰 TP بيع (${config.PARTIAL_TP_SELL_PERCENT}%)`, callback_data: 'change_PARTIAL_TP_SELL_PERCENT' }],
-        // --- قسم الفلاتر الأولية ---
         [{ text: `⏱️ عمر أدنى (${config.MIN_AGE_MINUTES} د)`, callback_data: 'change_MIN_AGE_MINUTES' }, { text: `⏱️ عمر أقصى (${config.MAX_AGE_HOURS} س)`, callback_data: 'change_MAX_AGE_HOURS' }],
         [{ text: `💧 سيولة USD ($${config.MIN_LIQUIDITY_USD})`, callback_data: 'change_MIN_LIQUIDITY_USD' }],
         [{ text: `📊 حجم/س ($${config.MIN_VOLUME_H1})`, callback_data: 'change_MIN_VOLUME_H1' }, { text: `🔄 معاملات/س (${config.MIN_TXNS_H1})`, callback_data: 'change_MIN_TXNS_H1' }],
-        // --- قسم الدرع الفولاذي ---
         [{ text: `🔒 قفل سيولة (${config.MIN_LOCKED_LIQUIDITY_PERCENT}%)`, callback_data: 'change_MIN_LOCKED_LIQUIDITY_PERCENT' }],
         [{ text: `🐳 حيتان (${config.MAX_TOP_HOLDERS_PERCENT}%)`, callback_data: 'change_MAX_TOP_HOLDERS_PERCENT' }, { text: `👨‍💻 مطور (${config.MAX_CREATOR_PERCENT}%)`, callback_data: 'change_MAX_CREATOR_PERCENT' }],
-        // زر التخلي عن العقد غير قابل للتعديل حاليًا
     ];
     telegram.sendMessage(chatId, "<b>⚙️ اختر الإعداد لتغييره:</b>", { parse_mode: "HTML", reply_markup: { inline_keyboard: keyboard } });
 }
@@ -507,7 +550,6 @@ function showSellPercentageMenu(chatId, messageId, tokenAddress) {
 
 // معالجة أخطاء تليجرام العامة
 telegram.on('polling_error', (error) => {
-    // تجنب إغراق السجل بأخطاء الاتصال المؤقتة الشائعة
     if (!error.message.includes('ETIMEDOUT') && !error.message.includes('ECONNRESET')) {
         logger.error(`[خطأ تليجرام] ${error.code}: ${error.message}`);
     }
