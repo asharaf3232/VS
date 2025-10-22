@@ -251,52 +251,40 @@ function removeTrade(tradeToRemove) { const i = activeTrades.findIndex(t => t.to
 // 6. الراصد ونقطة الانطلاق (v9.7 "راصد الزخم الآمن - فلترة محسنة")
 // =================================================================
 /**
- * جلب وفلترة العملات الجديدة من DexScreener (v9.8 المصححة + تشخيص العمر)
+ * جلب وفلترة العملات الجديدة من DexScreener (v9.9 المصححة - إصلاح نهائي لحساب العمر)
  */
 async function fetchTrendingPairs() {
     if (config.IS_PAUSED) { logger.info('🛑 البوت متوقف.'); return []; }
     try {
-        const url = `https://api.dexscreener.com/latest/dex/tokens/${config.WBNB_ADDRESS}`; // جلب أزواج WBNB
+        const url = `https://api.dexscreener.com/latest/dex/tokens/${config.WBNB_ADDRESS}`;
         logger.info(`📡 جلب أزواج WBNB...`);
         const response = await axios.get(url, { headers: { 'Accept': 'application/json' }, timeout: 10000 });
 
         if (response.data && response.data.pairs) {
             const allPairs = response.data.pairs;
-
             const filteredPairs = allPairs.filter(pair => {
-                // التحقق الأولي من وجود البيانات الأساسية وأنها على BSC
-                if (!pair || !pair.pairCreatedAt || !pair.chainId || pair.chainId !== 'bsc' || !pair.baseToken || !pair.baseToken.address) {
-                    if (config.DEBUG_MODE) logger.info(`[فلتر] رفض زوج ببيانات ناقصة.`);
+                if (!pair || !pair.pairCreatedAt || !pair.chainId || pair.chainId !== 'bsc' || !pair.baseToken || !pair.baseToken.address) return false;
+
+                const tokenAddress = pair.baseToken.address;
+
+                // ===== <<< إصلاح v9.9: pairCreatedAt هي مللي ثانية بالفعل >>> =====
+                let createdAtMs;
+                if (typeof pair.pairCreatedAt === 'number') {
+                    createdAtMs = pair.pairCreatedAt; // استخدم القيمة مباشرة
+                } else if (typeof pair.pairCreatedAt === 'string') {
+                    try { // محاولة تحويل النص إلى رقم (مللي ثانية)
+                        createdAtMs = parseInt(pair.pairCreatedAt, 10);
+                        if (isNaN(createdAtMs)) throw new Error('Invalid timestamp string');
+                    } catch (e) {
+                        logger.error(`[خطأ عمر] فشل تحويل pairCreatedAt النصي: ${pair.pairCreatedAt} لـ ${tokenAddress.slice(0,10)}`);
+                        return false;
+                    }
+                } else {
+                    logger.error(`[خطأ عمر] نوع pairCreatedAt غير متوقع: ${typeof pair.pairCreatedAt} لـ ${tokenAddress.slice(0,10)}`);
                     return false;
                 }
 
-                const tokenAddress = pair.baseToken.address; // للحصول على العنوان
-
-                // ===== <<< خطوة تشخيصية: اطبع القيمة الأصلية ونوعها >>> =====
-                if (config.DEBUG_MODE) {
-                    logger.info(`[تشخيص] pairCreatedAt الخام لـ ${tokenAddress.slice(0,10)}: ${pair.pairCreatedAt} (النوع: ${typeof pair.pairCreatedAt})`);
-                }
-                // =======================================================
-
-                // ===== <<< حساب العمر (بافتراض أن pair.pairCreatedAt بالثواني) >>> =====
-                let createdAtMs;
-                // التحقق من نوع البيانات قبل الضرب
-                if (typeof pair.pairCreatedAt === 'number') {
-                     createdAtMs = pair.pairCreatedAt * 1000; // تحويل الثواني إلى مللي ثانية
-                } else if (typeof pair.pairCreatedAt === 'string') {
-                     // محاولة تحويل النص إلى رقم (ثواني) ثم إلى مللي ثانية
-                     try {
-                         createdAtMs = parseInt(pair.pairCreatedAt, 10) * 1000;
-                         if (isNaN(createdAtMs)) throw new Error('Invalid timestamp string');
-                     } catch (e) {
-                         logger.error(`[خطأ عمر] فشل في تحويل pairCreatedAt النصي: ${pair.pairCreatedAt} لـ ${tokenAddress.slice(0,10)}`);
-                         return false; // رفض إذا كان التوقيت غير صالح
-                     }
-                } else {
-                     logger.error(`[خطأ عمر] نوع pairCreatedAt غير متوقع: ${typeof pair.pairCreatedAt} لـ ${tokenAddress.slice(0,10)}`);
-                     return false; // رفض إذا كان النوع غير متوقع
-                }
-
+                // حساب العمر الصحيح الآن
                 const ageMs = Date.now() - createdAtMs;
                 const ageMinutes = ageMs / (1000 * 60);
                 // =============================================================
@@ -325,11 +313,9 @@ async function fetchTrendingPairs() {
                     if (config.DEBUG_MODE) logger.info(`[فلتر] رفض ${tokenAddress.slice(0,10)}: معاملات ${totalTxns}/س`);
                     return false;
                 }
-                // إذا اجتاز كل الفلاتر
                 return true;
             });
 
-            // ترتيب النتائج المفلترة حسب الأقدم ضمن النطاق المسموح به أولاً
             filteredPairs.sort((a, b) => a.pairCreatedAt - b.pairCreatedAt);
             lastPairsFound = filteredPairs.length;
             logger.info(`✅ ${lastPairsFound} هدف مطابق للمعايير الأولية (من ${allPairs.length}).`);
@@ -338,7 +324,6 @@ async function fetchTrendingPairs() {
         lastPairsFound = 0; logger.warn(`⚠️ لم يتم العثور على أزواج WBNB.`); return [];
     } catch (error) { logger.error(`❌ خطأ DexScreener: ${error.message}`); lastPairsFound = 0; return []; }
 }
-
 async function processNewTarget(pair) {
     if (!pair || !pair.pairAddress || !pair.baseToken || !pair.baseToken.address) return;
     const pairAddress = pair.pairAddress; const tokenAddress = pair.baseToken.address;
