@@ -1,5 +1,5 @@
 // =================================================================
-// صياد الدرر: v9.9-Fixed (إصلاح تحديد العملة + إصلاح حساب العمر)
+// صياد الدرر: v10 (إصلاح نقطة نهاية الراصد)
 // =================================================================
 import { ethers } from 'ethers';
 import dotenv from 'dotenv';
@@ -10,7 +10,7 @@ import axios from 'axios';
 
 // --- نظام التسجيل ---
 const logger = winston.createLogger({
-    level: process.env.DEBUG_MODE === 'true' ? 'info' : 'info', // Keep INFO level for now
+    level: process.env.DEBUG_MODE === 'true' ? 'info' : 'info',
     format: winston.format.combine(
         winston.format.timestamp({ format: 'YYYY-MM-DD HH:mm:ss' }),
         winston.format.printf(info => `${info.timestamp} - ${info.level.toUpperCase()}: ${info.message}`)
@@ -90,7 +90,7 @@ const SETTING_PROMPTS = {
 };
 
 // =================================================================
-// 1. المدقق (Verifier) - الدرع الفولاذي v9.7 (لا تغيير)
+// 1. المدقق (Verifier) - (لا تغيير)
 // =================================================================
 async function sleep(ms) { return new Promise(resolve => setTimeout(resolve, ms)); }
 
@@ -148,7 +148,7 @@ async function fullCheck(pairAddress, tokenAddress) {
         const amountIn = ethers.parseUnits("1", decimals);
         await routerContract.getAmountsOut.staticCall(amountIn, [tokenAddress, config.WBNB_ADDRESS]);
         logger.info(` -> ✅ فحص شامل ناجح.`);
-        return { passed: true, reason: "اجتاز الفحص الشامل (v9.9)" };
+        return { passed: true, reason: "اجتاز الفحص الشامل (v10)" };
     } catch (error) {
         const isHoneypot = error.message.includes('INSUFFICIENT_OUTPUT_AMOUNT') || error.message.includes('TRANSFER_FROM_FAILED') || error.code === 'CALL_EXCEPTION';
         const reason = isHoneypot ? `فخ عسل (محاكاة فشلت)` : `فشل فحص غير متوقع`;
@@ -248,16 +248,21 @@ function removeTrade(tradeToRemove) { const i = activeTrades.findIndex(t => t.to
 
 
 // =================================================================
-// 6. الراصد ونقطة الانطلاق (v9.9-Fixed)
+// 6. الراصد ونقطة الانطلاق (v10 - إصلاح نقطة النهاية)
 // =================================================================
 /**
- * جلب وفلترة العملات الجديدة من DexScreener (v9.9-Fixed)
+ * جلب وفلترة العملات الجديدة من DexScreener (v10)
  */
 async function fetchTrendingPairs() {
     if (config.IS_PAUSED) { logger.info('🛑 البوت متوقف.'); return []; }
     try {
-        const url = `https://api.dexscreener.com/latest/dex/tokens/${config.WBNB_ADDRESS}`;
-        logger.info(`📡 جلب أزواج WBNB...`);
+        // --- بداية الإصلاح v10: تغيير نقطة النهاية ---
+        // بدلاً من طلب "أزواج لعملة WBNB" (التي تعيد العملات المستقرة)
+        // نطلب "أحدث الأزواج على شبكة BSC"
+        const url = `https://api.dexscreener.com/latest/dex/pairs/bsc`;
+        logger.info(`📡 جلب أحدث أزواج BSC...`);
+        // --- نهاية الإصلاح v10 ---
+        
         const response = await axios.get(url, { headers: { 'Accept': 'application/json' }, timeout: 10000 });
 
         if (response.data && response.data.pairs) {
@@ -266,7 +271,7 @@ async function fetchTrendingPairs() {
                 // فحص أولي لوجود البيانات الأساسية
                 if (!pair || !pair.pairCreatedAt || !pair.chainId || pair.chainId !== 'bsc' || !pair.baseToken || !pair.baseToken.address || !pair.quoteToken || !pair.quoteToken.address) return false;
 
-                // --- بداية الإصلاح: تحديد العملة الصحيحة (ليست WBNB) ---
+                // --- بداية الإصلاح v9.9: تحديد العملة الصحيحة (ليست WBNB) ---
                 let tokenAddress;
                 let tokenSymbol;
                 const wbnbAddressLower = config.WBNB_ADDRESS.toLowerCase();
@@ -278,9 +283,9 @@ async function fetchTrendingPairs() {
                     tokenAddress = pair.baseToken.address;
                     tokenSymbol = pair.baseToken.symbol;
                 } else {
-                    return false; // ليس زوج WBNB
+                    return false; // ليس زوج WBNB (مثل BUSD/USDT)
                 }
-                // --- نهاية الإصلاح ---
+                // --- نهاية الإصلاح v9.9 ---
 
                 // تأكد أن العملة ليست WBNB نفسها (مهم جداً)
                 if (tokenAddress.toLowerCase() === wbnbAddressLower) return false;
@@ -330,22 +335,22 @@ async function fetchTrendingPairs() {
 
             filteredPairs.sort((a, b) => a.pairCreatedAt - b.pairCreatedAt);
             lastPairsFound = filteredPairs.length;
-            logger.info(`✅ ${lastPairsFound} هدف مطابق للمعايير الأولية (من ${allPairs.length}).`);
+            logger.info(`✅ ${lastPairsFound} هدف WBNB مطابق للمعايير الأولية (من ${allPairs.length} زوج BSC).`);
             return filteredPairs;
         }
-        lastPairsFound = 0; logger.warn(`⚠️ لم يتم العثور على أزواج WBNB.`); return [];
+        lastPairsFound = 0; logger.warn(`⚠️ لم يتم العثور على أزواج BSC.`); return [];
     } catch (error) { logger.error(`❌ خطأ DexScreener: ${error.message}`); lastPairsFound = 0; return []; }
 }
 
 /**
- * معالجة الهدف (v9.9-Fixed)
+ * معالجة الهدف (v9.9-Fixed - لا تغيير هنا)
  */
 async function processNewTarget(pair) {
     if (!pair || !pair.pairAddress || !pair.baseToken || !pair.baseToken.address || !pair.quoteToken || !pair.quoteToken.address) return;
 
     const wbnbAddressLower = config.WBNB_ADDRESS.toLowerCase();
 
-    // --- بداية الإصلاح 1: تحديد العملة الصحيحة ---
+    // --- الإصلاح 1: تحديد العملة الصحيحة ---
     let tokenAddress;
     let tokenSymbol;
     if (pair.baseToken.address.toLowerCase() === wbnbAddressLower) {
@@ -355,12 +360,11 @@ async function processNewTarget(pair) {
         tokenAddress = pair.baseToken.address;
         tokenSymbol = pair.baseToken.symbol;
     } else {
-        return; // ليس زوج WBNB
+        return; // ليس زوج WBNB (هذا نظريًا لن يحدث لأن fetchTrendingPairs فلترته)
     }
     // --- نهاية الإصلاح 1 ---
 
     const pairAddress = pair.pairAddress;
-    // التأكد من عدم المعالجة السابقة أو أن العملة هي WBNB
     if (processedPairs.has(pairAddress) || tokenAddress.toLowerCase() === wbnbAddressLower) return;
     processedPairs.add(pairAddress);
 
@@ -369,12 +373,11 @@ async function processNewTarget(pair) {
     const txnsH1 = pair.txns?.h1 || {};
     const totalTxns = (txnsH1.buys || 0) + (txnsH1.sells || 0);
 
-    // --- بداية الإصلاح 2: حساب العمر (إزالة * 1000) ---
-    // pair.pairCreatedAt هي مللي ثانية
+    // --- الإصلاح 2: حساب العمر (إزالة * 1000) ---
     const ageMinutes = (Date.now() - pair.pairCreatedAt) / (1000 * 60);
     // --- نهاية الإصلاح 2 ---
 
-    // --- بداية الإصلاح 3: استخدام الرمز والاسم الصحيح ---
+    // --- الإصلاح 3: استخدام الرمز والاسم الصحيح ---
     logger.info(`\n🎯 مرشح! ${tokenSymbol} (${tokenAddress.slice(0, 10)}...)`);
     logger.info(`   ${ageMinutes.toFixed(1)}د | $${liquidityUsd.toFixed(0)} | ${volumeH1.toFixed(0)}/س | ${totalTxns}/س | 🔗 https://dexscreener.com/bsc/${pairAddress}`);
 
@@ -398,7 +401,7 @@ async function processNewTarget(pair) {
 
 
 async function pollForMomentum() {
-    logger.info("🚀 [راصد الزخم الآمن] بدأ (v9.9-Fixed).");
+    logger.info("🚀 [راصد الزخم الآمن] بدأ (v10).");
     while (true) {
         try {
             const pairs = await fetchTrendingPairs();
@@ -415,14 +418,14 @@ async function pollForMomentum() {
 // 7. الدالة الرئيسية (Main)
 // =================================================================
 async function main() {
-    logger.info(`--- بدء تشغيل (v9.9-Fixed) ---`);
+    logger.info(`--- بدء تشغيل (v10 - إصلاح الراصد) ---`);
     try {
         provider = new ethers.JsonRpcProvider(config.PROTECTED_RPC_URL);
         wallet = new ethers.Wallet(config.PRIVATE_KEY, provider);
         routerContract = new ethers.Contract(config.ROUTER_ADDRESS, ROUTER_ABI, wallet);
         loadTradesFromFile(); logger.info(`💾 ${activeTrades.length} صفقة محملة.`);
         const network = await provider.getNetwork(); logger.info(`✅ متصل بـ (${network.name}, ID: ${network.chainId})`);
-        const welcomeMsg = `✅ <b>راصد الزخم الآمن (v9.9-Fixed) بدأ!</b>`;
+        const welcomeMsg = `✅ <b>راصد الزخم الآمن (v10) بدأ!</b>`;
         await telegram.sendMessage(config.TELEGRAM_ADMIN_CHAT_ID, welcomeMsg, { parse_mode: 'HTML', reply_markup: getMainMenuKeyboard() });
 
         telegram.on('message', async (msg) => {
@@ -478,7 +481,7 @@ function getMainMenuKeyboard() {
 }
 
 async function showStatus(chatId) {
-    let statusText = `<b>📊 الحالة (v9.9-Fixed):</b>\n\n`; // تحديث الإصدار
+    let statusText = `<b>📊 الحالة (v10):</b>\n\n`; // تحديث الإصدار
     statusText += `<b>البحث:</b> ${config.IS_PAUSED ? 'موقوف⏸️' : 'نشط▶️'} | <b>تصحيح:</b> ${config.DEBUG_MODE ? 'فعّال🟢' : 'OFF⚪️'}\n`;
     statusText += `<b>شراء:</b> ${isWiseHawkHunting ? 'مشغول🦅' : 'جاهز'} | <b>أهداف:${lastPairsFound}</b>\n-----------------------------------\n`;
     let bnbBalance = 0; try { bnbBalance = parseFloat(ethers.formatEther(await provider.getBalance(config.WALLET_ADDRESS))); } catch (e) { logger.error(`[Status] خطأ رصيد BNB: ${e.message}`); }
