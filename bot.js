@@ -1,5 +1,5 @@
 // =================================================================
-// صياد الدرر: v13.2 (بروتوكول صياد الأنهار - فلترة مزدوجة)
+// صياد الدرر: v14.0 (بروتوكول مراقب البلوكتشين)
 // =================================================================
 import { ethers } from 'ethers';
 import dotenv from 'dotenv';
@@ -24,8 +24,8 @@ const logger = winston.createLogger({
 // --- تحميل الإعدادات ---
 dotenv.config();
 const config = {
-    PROTECTED_RPC_URL: process.env.PROTECTED_RPC_URL,
-    NODE_URL: process.env.NODE_URL, 
+    PROTECTED_RPC_URL: process.env.PROTECTED_RPC_URL, // يُستخدم للمعاملات والفحص
+    NODE_URL: process.env.NODE_URL, // يجب أن يكون WSS (WebSocket) للمراقبة
     GOPLUS_API_KEY: process.env.GOPLUS_API_KEY,
     WALLET_ADDRESS: process.env.WALLET_ADDRESS,
     PRIVATE_KEY: process.env.PRIVATE_KEY,
@@ -33,66 +33,76 @@ const config = {
     TELEGRAM_ADMIN_CHAT_ID: process.env.TELEGRAM_ADMIN_CHAT_ID,
     ROUTER_ADDRESS: '0x10ED43C718714eb63d5aA57B78B54704E256024E',
     WBNB_ADDRESS: "0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c",
-    PANCAKE_FACTORY_ADDRESS: '0xcA143Ce32Fe78f1f7019d7d551a6402fC5350c73', 
+    PANCAKE_FACTORY_ADDRESS: '0xcA143Ce32Fe78f1f7019d7d551a6402fC5350c73',
     BUY_AMOUNT_BNB: parseFloat(process.env.BUY_AMOUNT_BNB || '0.01'),
     GAS_PRIORITY_MULTIPLIER: parseInt(process.env.GAS_PRIORITY_MULTIPLIER || '2', 10),
     SLIPPAGE_LIMIT: parseInt(process.env.SLIPPAGE_LIMIT || '49', 10),
     GAS_LIMIT: BigInt(process.env.GAS_LIMIT || '800000'),
-    MINIMUM_LIQUIDITY_BNB: parseFloat(process.env.MINIMUM_LIQUIDITY_BNB || '5.0'), // (فحص أمني)
+    // --- فلتر "مراقب البلوكتشين" v14.0 ---
+    MIN_LIQUIDITY_ADD_BNB: parseFloat(process.env.MIN_LIQUIDITY_ADD_BNB || '1.0'), // الحد الأدنى للسيولة المضافة في نفس الكتلة
+    
+    // --- إعدادات الفحص الأمني (fullCheck) ---
+    MINIMUM_LIQUIDITY_BNB: parseFloat(process.env.MINIMUM_LIQUIDITY_BNB || '1.0'), // (فحص أمني بعد الاكتشاف)
+    MIN_LOCKED_LIQUIDITY_PERCENT: parseFloat(process.env.MIN_LOCKED_LIQUIDITY_PERCENT || '85.0'),
+    MAX_TOP_HOLDERS_PERCENT: parseFloat(process.env.MAX_TOP_HOLDERS_PERCENT || '30.0'),
+    MAX_CREATOR_PERCENT: parseFloat(process.env.MAX_CREATOR_PERCENT || '5.0'),
+    REQUIRE_OWNERSHIP_RENOUNCED: process.env.REQUIRE_OWNERSHIP_RENOUNCED === 'false',
+    
+    // --- إعدادات إدارة الصفقة ---
     TRAILING_STOP_LOSS_PERCENT: parseInt(process.env.TRAILING_STOP_LOSS_PERCENT || '20', 10),
     PARTIAL_TP_PERCENT: parseInt(process.env.PARTIAL_TP_PERCENT || '100', 10),
     PARTIAL_TP_SELL_PERCENT: parseInt(process.env.PARTIAL_TP_SELL_PERCENT || '50', 10),
+    
     DEBUG_MODE: process.env.DEBUG_MODE === 'true',
     IS_PAUSED: false,
-    // Steel Shield Settings (للـ fullCheck)
-    MIN_LOCKED_LIQUIDITY_PERCENT: parseFloat(process.env.MIN_LOCKED_LIQUIDITY_PERCENT || '95.0'),
-    MAX_TOP_HOLDERS_PERCENT: parseFloat(process.env.MAX_TOP_HOLDERS_PERCENT || '20.0'),
-    MAX_CREATOR_PERCENT: parseFloat(process.env.MAX_CREATOR_PERCENT || '5.0'),
-    REQUIRE_OWNERSHIP_RENOUNCED: process.env.REQUIRE_OWNERSHIP_RENOUNCED === 'true',
-    // --- إعدادات بروتوكول صياد الأنهار (v13.2) ---
-    SCAN_INTERVAL_SECONDS: parseInt(process.env.SCAN_INTERVAL_SECONDS || '300', 10), // 5 minutes
-    MIN_AGE_MINUTES: parseInt(process.env.MIN_AGE_MINUTES || '180', 10), // (فلتر المسح) 3 ساعات
-    MAX_AGE_HOURS: parseInt(process.env.MAX_AGE_HOURS || '24', 10),      // (فلتر المسح) 24 ساعة
-    MIN_LIQUIDITY_USD: parseInt(process.env.MIN_LIQUIDITY_USD || '50000', 10), // (فلتر المسح) 50 ألف دولار
-    MIN_VOLUME_H1: parseInt(process.env.MIN_VOLUME_H1 || '10000', 10), // (فلتر المسح) 10 آلاف دولار
 };
 
-// --- ABIs ---
+// --- ABIs الكاملة للمحلل v14.0 ---
+const ROUTER_ABI = [
+    'function addLiquidityETH(address token, uint amountTokenDesired, uint amountTokenMin, uint amountETHMin, address to, uint deadline) external payable returns (uint amountToken, uint amountETH, uint liquidity)',
+    'function swapExactETHForTokens(uint amountOutMin, address[] calldata path, address to, uint deadline) external payable returns (uint[] memory amounts)',
+    'function getAmountsOut(uint amountIn, address[] memory path) public view returns (uint[] memory amounts)',
+    'function swapExactTokensForETHSupportingFeeOnTransferTokens(uint amountIn, uint amountOutMin, address[] calldata path, address to, uint deadline) external'
+];
+const FACTORY_ABI = [
+    'function createPair(address tokenA, address tokenB) external returns (address pair)',
+    'function getPair(address tokenA, address tokenB) external view returns (address pair)',
+    'event PairCreated(address indexed token0, address indexed token1, address pair, uint)'
+];
 const PAIR_ABI = ['function getReserves() external view returns (uint112 reserve0, uint112 reserve1, uint32 blockTimestampLast)', 'function token0() external view returns (address)'];
-const ROUTER_ABI = ['function getAmountsOut(uint amountIn, address[] memory path) public view returns (uint[] memory amounts)', 'function swapExactETHForTokens(uint amountOutMin, address[] calldata path, address to, uint deadline) external payable returns (uint[] memory amounts)', 'function swapExactTokensForETHSupportingFeeOnTransferTokens(uint amountIn, uint amountOutMin, address[] calldata path, address to, uint deadline) external'];
 const ERC20_ABI = ['function decimals() view returns (uint8)', 'function approve(address spender, uint256 amount) external returns (bool)', 'function balanceOf(address account) external view returns (uint256)'];
 
 // --- Global Variables ---
-let provider, wallet, routerContract;
+let provider, wallet, routerContract, factoryContract, listenerProvider;
 const activeTrades = [];
 const telegram = new TelegramBot(config.TELEGRAM_BOT_TOKEN, { polling: true });
 const userState = {};
 const TRADES_FILE = 'active_trades.json';
 const sellingLocks = new Set();
-const processedPairs = new Set(); 
+const processedPairs = new Set(); // يُستخدم لمنع إعادة المعالجة في نفس الدورة
 let isWiseHawkHunting = false;
-const potentialTrades = new Map(); 
+const potentialTrades = new Map(); // K: tokenAddress, V: { pairAddress: string, foundAt: number }
 
-// --- إعدادات الرسائل (v13.2) ---
+// --- واجهات فك التشفير v14.0 ---
+const factoryInterface = new ethers.Interface(FACTORY_ABI);
+const routerInterface = new ethers.Interface(ROUTER_ABI);
+const minLiquidityWei = ethers.parseEther(config.MIN_LIQUIDITY_ADD_BNB.toString());
+
+// --- إعدادات الرسائل (v14.0) ---
 const SETTING_PROMPTS = {
     "BUY_AMOUNT_BNB": "يرجى إرسال مبلغ الشراء الجديد بالـ BNB (مثال: 0.01):",
     "GAS_PRIORITY_MULTIPLIER": "يرجى إرسال مضاعف غاز الأولوية الجديد (مثال: 2):",
-    "SLIPPAGE_LIMIT": "يرجى إrsal نسبة الانزلاق السعري الجديدة (مثال: 49):",
-    "MINIMUM_LIQUIDITY_BNB": "يرجى إرسال الحد الأدنى لسيولة BNB للفحص الأمني (مثال: 5.0):",
+    "SLIPPAGE_LIMIT": "يرجى إرسال نسبة الانزلاق السعري الجديدة (مثال: 49):",
+    "MIN_LIQUIDITY_ADD_BNB": `(فلتر المراقب) يرجى إرسال الحد الأدنى لسيولة BNB المضافة (مثال: 1.0):`,
+    "MINIMUM_LIQUIDITY_BNB": "(الفحص الأمني) يرجى إرسال الحد الأدنى لسيولة BNB (مثال: 1.0):",
     "TRAILING_STOP_LOSS_PERCENT": "يرجى إرسال نسبة وقف الخسارة المتحرك الجديدة (مثال: 20):",
     "PARTIAL_TP_PERCENT": "يرجى إرسال نسبة الربح لجني الأرباح الجزئي (مثال: 100):",
     "PARTIAL_TP_SELL_PERCENT": "يرجى إرسال نسبة البيع عند جني الأرباح الجزئي (مثال: 50):",
-    // فلاتر الدرع
-    "MIN_LOCKED_LIQUIDITY_PERCENT": `يرجى إرسال الحد الأدنى لنسبة قفل السيولة (مثال: 95):`,
-    "MAX_TOP_HOLDERS_PERCENT": `يرجى إرسال الحد الأقصى لنسبة تركيز أكبر 10 حيتان (مثال: 20):`,
+    "MIN_LOCKED_LIQUIDITY_PERCENT": `يرجى إرسال الحد الأدنى لنسبة قفل السيولة (مثال: 85):`,
+    "MAX_TOP_HOLDERS_PERCENT": `يرجى إrsal الحد الأقصى لنسبة تركيز أكبر 10 حيتان (مثال: 30):`,
     "MAX_CREATOR_PERCENT": `يرجى إرسال الحد الأقصى لنسبة ملكية المطور (مثال: 5):`,
-    // فلاتر الماسح (v13.2)
-    "SCAN_INTERVAL_SECONDS": `يرجى إرسال الفاصل الزمني للمسح بالثواني (مثال: 300):`,
-    "MIN_AGE_MINUTES": `(فلتر المسح) يرجى إرسال الحد الأدنى للعمر بالدقائق (مثال: 180):`,
-    "MAX_AGE_HOURS": `(فلتر المسح) يرجى إرسال الحد الأقصى للعمر بالساعات (مثال: 24):`,
-    "MIN_LIQUIDITY_USD": `(فلتر المسح) يرجى إرسال الحد الأدنى للسيولة بالدولار (مثال: 50000):`,
-    "MIN_VOLUME_H1": `(فلتر المسح) يرجى إرسال الحد الأدنى للحجم بالدولار في آخر ساعة (مثال: 10000):`,
 };
+
 
 // =================================================================
 // 1. المدقق (Verifier) - (لا تغيير)
@@ -141,20 +151,16 @@ async function fullCheck(pairAddress, tokenAddress) {
         const wbnbReserve = token0.toLowerCase() === config.WBNB_ADDRESS.toLowerCase() ? reserves[0] : reserves[1];
         const wbnbLiquidity = parseFloat(ethers.formatEther(wbnbReserve));
 
-        // فحص سيولة BNB
         if (wbnbLiquidity < config.MINIMUM_LIQUIDITY_BNB) return { passed: false, reason: `فشل فحص الأمان: سيولة BNB غير كافية (${wbnbLiquidity.toFixed(2)})` };
-
-        // فحص GoPlus + الدرع الفولاذي
         const securityResult = await checkTokenSecurity(tokenAddress);
         if (!securityResult.is_safe) return { passed: false, reason: `فشل فحص الأمان: ${securityResult.reason}` };
 
-        // محاكاة البيع
         const tokenContract = new ethers.Contract(tokenAddress, ERC20_ABI, provider);
         let decimals; try { decimals = Number(await tokenContract.decimals()); } catch (e) { decimals = 18; }
         const amountIn = ethers.parseUnits("1", decimals);
         await routerContract.getAmountsOut.staticCall(amountIn, [tokenAddress, config.WBNB_ADDRESS]);
         logger.info(` -> ✅ فحص أمني عميق ناجح.`);
-        return { passed: true, reason: "اجتاز الفحص الأمني العميق (v13.2)" };
+        return { passed: true, reason: "اجتاز الفحص الأمني العميق (v14.0)" };
     } catch (error) {
         const isHoneypot = error.message.includes('INSUFFICIENT_OUTPUT_AMOUNT') || error.message.includes('TRANSFER_FROM_FAILED') || error.code === 'CALL_EXCEPTION';
         const reason = isHoneypot ? `فخ عسل (محاكاة فشلت)` : `فشل فحص غير متوقع`;
@@ -195,9 +201,8 @@ async function snipeToken(pairAddress, tokenAddress) {
         } else { logger.error(`🚨 فشل معاملة شراء ${tokenAddress} (الحالة 0).`); isWiseHawkHunting = false; }
     } catch (error) { 
         logger.error(`❌ خطأ شراء ${tokenAddress}: ${error.reason || error.message}`); 
-        // --- تصحيح v13.2: إرسال خطأ الرصيد إلى تليجرام ---
         if (error.code === 'INSUFFICIENT_FUNDS') {
-            await telegram.sendMessage(config.TELEGRAM_ADMIN_CHAT_ID, `🚨 <b>فشل الشراء: رصيد غير كافٍ!</b>\nحاول البوت شراء <code>${tokenAddress.slice(0,10)}...</code> ولكن الرصيد لا يكفي لتغطية ${config.BUY_AMOUNT_BNB} BNB + الغاز.\n\nالرصيد الحالي: ${ethers.formatEther(error.transaction?.value || 0)} BNB (تقريباً)\nالمطلوب: ${ethers.formatEther(error.transaction?.value || 0)} BNB`, { parse_mode: 'HTML' });
+            await telegram.sendMessage(config.TELEGRAM_ADMIN_CHAT_ID, `🚨 <b>فشل الشراء: رصيد غير كافٍ!</b>\nحاول البوت شراء <code>${tokenAddress.slice(0,10)}...</code> ولكن الرصيد لا يكفي لتغطية ${config.BUY_AMOUNT_BNB} BNB + الغاز.`, { parse_mode: 'HTML' });
         }
         isWiseHawkHunting = false; 
     }
@@ -262,135 +267,217 @@ function loadTradesFromFile() { try { if (fs.existsSync(TRADES_FILE)) { const d 
 function removeTrade(tradeToRemove) { const i = activeTrades.findIndex(t => t.tokenAddress === tradeToRemove.tokenAddress); if (i > -1) { activeTrades.splice(i, 1); logger.info(`🗑️ تمت إزالة ${tradeToRemove.tokenAddress.slice(0,10)}`); saveTradesToFile(); isWiseHawkHunting = false; } }
 
 // =================================================================
-// 6. الراصد ونقطة الانطلاق (v13.2 - بروتوكول صياد الأنهار)
+// 6. الراصد ونقطة الانطلاق (v14.0 - بروتوكول مراقب البلوكتشين)
 // =================================================================
 
 /**
- * [مطور v13.2] صياد الأنهار - يطبق فلترة مزدوجة (Query + Double Check)
+ * [جديد v14.0] معالج الكتلة
+ * يتم استدعاؤه لكل كتلة جديدة بواسطة المستمع
  */
-async function scanForRiverGems() {
-    logger.info(`🎣 [صياد الأنهار v13.2] بدء دورة المسح (كل ${config.SCAN_INTERVAL_SECONDS} ثانية)...`);
+async function processBlock(blockNumber) {
+    if (config.IS_PAUSED) return;
     
-    while (true) {
+    let block;
+    try {
+        // جلب الكتلة كاملة مع جميع معاملاتها
+        block = await listenerProvider.getBlock(blockNumber, true); // true لـ prefetch transactions
+        if (!block || !block.transactions) {
+            if (config.DEBUG_MODE) logger.warn(`[مراقب] لم يتم العثور على معاملات في الكتلة ${blockNumber}.`);
+            return;
+        }
+    } catch (error) {
+        logger.error(`[مراقب] ❌ فشل جلب الكتلة ${blockNumber}: ${error.message}`);
+        return;
+    }
+
+    if (config.DEBUG_MODE) logger.info(`[مراقب] ... معالجة الكتلة ${blockNumber} (مع ${block.transactions.length} معاملة)`);
+
+    const createdTokensInBlock = new Set();
+    const liquidityAddedInBlock = new Map(); // K: tokenAddress (lower), V: bnbValue (BigInt)
+    const wbnbLower = config.WBNB_ADDRESS.toLowerCase();
+    const factoryLower = config.PANCAKE_FACTORY_ADDRESS.toLowerCase();
+    const routerLower = config.ROUTER_ADDRESS.toLowerCase();
+
+    for (const txHash of block.transactions) {
+        // txHash هو مجرد الهاش، نحتاج المعاملة الكاملة
+        const tx = txHash; // بما أننا استخدمنا prefetch، tx هو الكائن الكامل
+        
+        if (!tx.to || !tx.data || tx.data === '0x') continue;
+
+        const txTo = tx.to.toLowerCase();
+
         try {
-            if (config.IS_PAUSED) {
-                if (config.DEBUG_MODE) logger.info('[صياد الأنهار] المسح متوقف مؤقتاً.');
-                await sleep(60 * 1000); // انتظر دقيقة إذا كان متوقفًا مؤقتًا
-                continue;
-            }
-
-            // --- [تطوير v13.2] إضافة سقف للعمر في الاستعلام نفسه ---
-            const query = `(age.minutes > ${config.MIN_AGE_MINUTES}) AND (age.hours < ${config.MAX_AGE_HOURS}) AND (liquidity.usd > ${config.MIN_LIQUIDITY_USD}) AND (volume.h1 > ${config.MIN_VOLUME_H1})`;
-            const url = `https://api.dexscreener.com/latest/dex/search?q=${encodeURIComponent(query)}`;
-            
-            if (config.DEBUG_MODE) logger.info(`[صياد الأنهار] إرسال استعلام: ${query}`);
-
-            const response = await axios.get(url, { 
-                headers: { 'Accept': 'application/json' },
-                timeout: 15000 
-            });
-            
-            if (response.data && response.data.pairs) {
-                const pairs = response.data.pairs.filter(p => p.chainId === 'bsc'); // فلترة لشبكة BSC فقط
-                if (config.DEBUG_MODE) logger.info(`[صياد الأنهار] تم العثور على ${pairs.length} زوجًا مطابقًا للمعايير. بدء التصفية والتحقق المزدوج...`);
-
-                const now = Date.now(); // الوقت الحالي
-                const minAgeMs = config.MIN_AGE_MINUTES * 60 * 1000;
-                const maxAgeMs = config.MAX_AGE_HOURS * 60 * 60 * 1000;
-
-                for (const pair of pairs) {
+            // --- المرحلة 1: البحث عن إنشاء زوج ---
+            if (txTo === factoryLower) {
+                const parsedTx = factoryInterface.parseTransaction(tx);
+                if (parsedTx && parsedTx.name === 'createPair') {
+                    const tokenA = parsedTx.args[0].toLowerCase();
+                    const tokenB = parsedTx.args[1].toLowerCase();
                     
-                    // --- [تطوير v13.1] التحقق المزدوج من العمر ---
-                    // لا نثق بفلتر DexScreener API
-                    const pairCreationTime = pair.pairCreatedAt || 0;
-                    if (pairCreationTime === 0) {
-                        if (config.DEBUG_MODE) logger.warn(`[صياد الأنهار] ⚠️ تجاهل ${pair.baseToken.symbol} (لا يوجد تاريخ إنشاء).`);
-                        continue; // تخطى إذا لم يكن هناك تاريخ إنشاء
-                    }
-
-                    const pairAgeMs = now - pairCreationTime; // عمر الزوج بالمللي ثانية
-
-                    // التحقق إذا كان العمر خارج النطاق الذي نريده
-                    if (pairAgeMs < minAgeMs || pairAgeMs > maxAgeMs) {
-                         if (config.DEBUG_MODE) {
-                             const ageHours = (pairAgeMs / (1000 * 60 * 60)).toFixed(1);
-                             logger.warn(`[صياد الأنهار] ⚠️ تجاهل ${pair.baseToken.symbol || pair.pairAddress.slice(0,6)} (العمر الفعلي: ${ageHours} س). API كذب!`);
-                         }
-                         continue; // تخطى هذا الزوج، عمره غير مطابق
-                    }
-                    // --- نهاية التحقق المزدوج ---
-
-
-                    if (pair.pairAddress && pair.baseToken?.address && pair.quoteToken?.address) {
-                        // نجح في التحقق المزدوج! مرر للفحص الأمني
-                        handlePairFound(pair.baseToken.address, pair.quoteToken.address, pair.pairAddress);
+                    // تحديد العملة (ليست WBNB)
+                    if (tokenA === wbnbLower) {
+                        createdTokensInBlock.add(tokenB);
+                    } else if (tokenB === wbnbLower) {
+                        createdTokensInBlock.add(tokenA);
                     }
                 }
-            } else {
-                logger.warn('[صياد الأنهار] استجابة API فارغة أو غير صالحة.');
             }
-        } catch (error) {
-            if (error.response && error.response.status === 429) {
-                 logger.error(`❌ [صياد الأنهار] تم حظر الـ IP (Rate Limit - 429). زيادة الفاصل الزمني للمسح قد يساعد.`);
-                 await sleep(config.SCAN_INTERVAL_SECONDS * 1000 * 2);
-            } else {
-                logger.error(`❌ [صياد الأنهار] خطأ أثناء المسح: ${error.message}`);
+
+            // --- المرحلة 2: البحث عن إضافة سيولة ---
+            if (txTo === routerLower) {
+                const parsedTx = routerInterface.parseTransaction(tx);
+                
+                // البحث فقط عن addLiquidityETH التي تحمل قيمة BNB
+                if (parsedTx && parsedTx.name === 'addLiquidityETH' && tx.value > 0n) {
+                    const tokenAddress = parsedTx.args[0].toLowerCase(); // أول وسيط هو عنوان العملة
+                    
+                    // التحقق من الحد الأدنى للسيولة المضافة
+                    if (tx.value >= minLiquidityWei) {
+                         if (config.DEBUG_MODE) logger.info(`[مراقب] 💧 إضافة سيولة مكتشفة لـ ${tokenAddress.slice(0,10)} [${ethers.formatEther(tx.value)} BNB]`);
+                        liquidityAddedInBlock.set(tokenAddress, tx.value);
+                    }
+                }
+            }
+        } catch (e) {
+            // تجاهل أخطاء فك التشفير (لمعاملات لا تهمنا)
+        }
+    }
+
+    // --- المرحلة 3: "الربط الذكي" ---
+    if (createdTokensInBlock.size === 0 || liquidityAddedInBlock.size === 0) {
+        return; // لا يوجد شيء للربط في هذه الكتلة
+    }
+
+    for (const tokenAddress of createdTokensInBlock) {
+        if (liquidityAddedInBlock.has(tokenAddress)) {
+            // 🎉🎉🎉 وجدنا واحد! 🎉🎉🎉
+            // تم إنشاء الزوج وإضافة السيولة له في نفس الكتلة
+            
+            const liquidityAmount = liquidityAddedInBlock.get(tokenAddress);
+            logger.info(`\n\n🎉 [مراقب ذكي] فرصة مؤكدة!`);
+            logger.info(`   العملة: ${tokenAddress}`);
+            logger.info(`   السيولة المضافة: ${ethers.formatEther(liquidityAmount)} BNB`);
+
+            // الآن نحتاج إلى جلب عنوان الزوج
+            try {
+                const pairAddress = await factoryContract.getPair(tokenAddress, config.WBNB_ADDRESS);
+                if (pairAddress && pairAddress !== ethers.ZeroAddress) {
+                    logger.info(`   الزوج: ${pairAddress}`);
+                    // تمريرها إلى المعالج
+                    handleCorrelatedPair(tokenAddress, pairAddress);
+                } else {
+                    logger.warn(`[مراقب] ⚠️ تم العثور على ${tokenAddress} ولكن فشل جلب الزوج.`);
+                }
+            } catch (e) {
+                logger.error(`[مراقب] ❌ خطأ جلب الزوج لـ ${tokenAddress}: ${e.message}`);
             }
         }
-
-        if (config.DEBUG_MODE) logger.info(`[صياد الأنهار] انتهاء دورة المسح. انتظار ${config.SCAN_INTERVAL_SECONDS} ثانية...`);
-        await sleep(config.SCAN_INTERVAL_SECONDS * 1000);
     }
 }
 
+
 /**
- * [معدل v13.0] معالج العثور على الزوج
- * يتم استدعاؤه الآن بواسطة الماسح بدلاً من المستمع
+ * [جديد v14.0] المستمع الرئيسي للبلوكتشين
  */
-function handlePairFound(token0, token1, pairAddress) {
-    if (config.IS_PAUSED) return;
-    const wbnbAddressLower = config.WBNB_ADDRESS.toLowerCase();
-    let tokenAddress;
-
-    // تحديد العملة المستهدفة (ليست WBNB)
-    if (token0.toLowerCase() === wbnbAddressLower) { tokenAddress = token1; }
-    else if (token1.toLowerCase() === wbnbAddressLower) { tokenAddress = token0; }
-    else { 
-        if (config.DEBUG_MODE) logger.info(`[صياد الأنهار] تجاهل زوج ليس WBNB: ${token0.slice(0,6)}/${token1.slice(0,6)}`);
-        return; 
+async function monitorBlockchain() {
+    logger.info("🚀 [مراقب v14.0] بدء حلقة الاتصال...");
+    
+    if (!config.NODE_URL || !config.NODE_URL.startsWith('ws')) {
+        logger.error(`[خطأ مراقب] NODE_URL يجب أن يكون رابط WebSocket (wss://)`);
+        process.exit(1);
     }
+    
+    let reconnectDelay = 5000;
+    const maxDelay = 300000; // 5 دقائق
 
-    // التحقق مما إذا كانت قيد المعالجة أو تم شراؤها بالفعل
+    while (true) {
+        try {
+            logger.info(`🔌 [مراقب] محاولة الاتصال بـ WebSocket (${config.NODE_URL})...`);
+            // مزود منفصل للاستماع
+            listenerProvider = new ethers.WebSocketProvider(config.NODE_URL);
+            
+            // التأكد من أن المزود الرئيسي (للمعاملات) يعمل أيضاً
+            await provider.getNetwork();
+            
+            // عقد المصنع (لجلب عنوان الزوج)
+            factoryContract = new ethers.Contract(config.PANCAKE_FACTORY_ADDRESS, FACTORY_ABI, provider);
+
+            logger.info("✅ [مراقب] تم الاتصال بـ WebSocket. بدء الاستماع للكتل...");
+            
+            listenerProvider.on('block', processBlock);
+
+            reconnectDelay = 5000; // إعادة ضبط التأخير عند الاتصال الناجح
+
+            // البقاء على قيد الحياة حتى يحدث خطأ
+            await new Promise((resolve, reject) => {
+                listenerProvider.on('error', (err) => {
+                    logger.error(`🔌 [مراقب] خطأ Provider WebSocket! ${err.code}: ${err.message}`);
+                    reject(err);
+                });
+                if (listenerProvider._websocket) {
+                    listenerProvider._websocket.onclose = () => {
+                        logger.warn("🔌 [مراقب] انقطع اتصال WebSocket!");
+                        resolve(); // الخروج من الوعد لإعادة الاتصال
+                    };
+                }
+            });
+
+        } catch (error) {
+            logger.error(`🔌 [مراقب] فشل الاتصال أو خطأ فادح: ${error.message}.`);
+        } finally {
+            // تنظيف المستمعين
+            if (listenerProvider) {
+                try {
+                    listenerProvider.removeAllListeners('block');
+                    listenerProvider.removeAllListeners('error');
+                    if (listenerProvider.destroy) listenerProvider.destroy();
+                    if (listenerProvider._websocket) listenerProvider._websocket.terminate();
+                } catch (e) {
+                     logger.warn(`[مراقب] خطأ أثناء التنظيف: ${e.message}`);
+                }
+            }
+            listenerProvider = null;
+            logger.info(`🔌 [مراقب] المحاولة مرة أخرى بعد ${reconnectDelay / 1000} ثانية...`);
+            await sleep(reconnectDelay);
+            reconnectDelay = Math.min(reconnectDelay * 2, maxDelay);
+        }
+    }
+}
+
+
+/**
+ * [معدل v14.0] معالج العثور على الزوج
+ * يتم استدعاؤه الآن فقط بواسطة "الربط الذكي"
+ */
+function handleCorrelatedPair(tokenAddress, pairAddress) {
+    if (config.IS_PAUSED) return;
+
     if (activeTrades.some(t => t.tokenAddress === tokenAddress) || potentialTrades.has(tokenAddress)) {
-        if (config.DEBUG_MODE) logger.info(`[صياد الأنهار] تجاهل عملة مكررة: ${tokenAddress.slice(0,10)}`);
+        if (config.DEBUG_MODE) logger.info(`[مراقب] تجاهل عملة مكررة: ${tokenAddress.slice(0,10)}`);
         return;
     }
     
-    logger.info(`\n\n🎯 [مرشح جديد مكتشف من النهر!]`);
-    logger.info(`   العملة: ${tokenAddress}`);
-    logger.info(`   الزوج: ${pairAddress}`);
     logger.info(`   -> تمت الإضافة إلى قائمة الفحص الأمني.\n`);
     potentialTrades.set(tokenAddress, { pairAddress: pairAddress, foundAt: Date.now() });
 }
 
 
 /**
- * [معدل v13.0] معالج قائمة المرشحين
+ * [معدل v14.0] معالج قائمة المرشحين
  * الآن يقوم فقط بالفحص الأمني والشراء
  */
 async function processPotentialTrades() {
-    logger.info(`[معالج v13.2] بدأ. (مراقبة قائمة الفحص الأمني)`);
+    logger.info(`[معالج v14.0] بدأ. (مراقبة قائمة الفحص الأمني)`);
 
     while (true) {
         try {
             if (config.IS_PAUSED || potentialTrades.size === 0) {
-                await sleep(10 * 1000); // انتظار 10 ثواني إذا كانت القائمة فارغة
+                await sleep(5 * 1000); // انتظار 5 ثواني إذا كانت القائمة فارغة
                 continue;
             }
 
             for (const [tokenAddress, data] of potentialTrades.entries()) {
                 
-                // منع المعالجة المتزامنة
                 if (processedPairs.has(data.pairAddress)) {
                     continue;
                 }
@@ -398,46 +485,44 @@ async function processPotentialTrades() {
 
                 logger.info(`\n\n[معالج] ${tokenAddress.slice(0,10)}. بدء الفحص الأمني العميق...`);
                 
-                // --- الخطوة 1: الفحص الأمني العميق (Deep Security Check) ---
+                // --- الخطوة 1: الفحص الأمني العميق ---
                 const securityCheck = await fullCheck(data.pairAddress, tokenAddress);
                 if (!securityCheck.passed) {
                     logger.warn(`[معالج] ❌ ${tokenAddress.slice(0,10)} - ${securityCheck.reason}. إزالة.`);
-                    potentialTrades.delete(tokenAddress); // فشل أمني = إزالة نهائية
+                    potentialTrades.delete(tokenAddress); 
                      if (config.DEBUG_MODE) await telegram.sendMessage(config.TELEGRAM_ADMIN_CHAT_ID, `<b>❌ مرفوض (فحص أمني)</b>\n<code>${tokenAddress}</code>\n<b>السبب:</b> ${securityCheck.reason}`, { parse_mode: 'HTML' });
-                    continue; // انتقل للعملة التالية
+                    continue; 
                 }
                 // (نجح الفحص الأمني)
 
-                // --- الخطوة 2: الانقضاض المحسوب (Calculated Strike) ---
-                logger.info(`[معالج] -> الخطوة 2: الانقضاض المحسوب...`);
+                // --- الخطوة 2: الانقضاض ---
+                logger.info(`[معالج] -> الخطوة 2: الانقضاض...`);
                 if (isWiseHawkHunting) {
                     logger.info(`⏳ ${tokenAddress.slice(0,10)} ينتظر (البوت مشغول بشراء آخر).`);
-                    processedPairs.delete(data.pairAddress); // السماح بإعادة المحاولة في الدورة التالية
-                    continue; // تخطى هذه العملة مؤقتًا
+                    processedPairs.delete(data.pairAddress); // السماح بإعادة المحاولة
+                    continue;
                 }
-                isWiseHawkHunting = true; // اقفل الصيد
+                isWiseHawkHunting = true; 
 
-                await telegram.sendMessage(config.TELEGRAM_ADMIN_CHAT_ID, `<b>🚀 فرصة مؤكدة!</b>\n<code>${tokenAddress}</code>\n✅ اجتاز فلاتر النهر والفحص الأمني.\n⏳ شراء...`, { parse_mode: 'HTML' });
+                await telegram.sendMessage(config.TELEGRAM_ADMIN_CHAT_ID, `<b>🚀 فرصة مؤكدة! (v14.0)</b>\n<code>${tokenAddress}</code>\n✅ اجتاز مراقبة الكتلة والفحص الأمني.\n⏳ شراء...`, { parse_mode: 'HTML' });
 
                 try {
                     await snipeToken(data.pairAddress, tokenAddress);
                 } catch (e) {
                     logger.error(`Error during snipeToken call: ${e}`);
-                    isWiseHawkHunting = false; // تأكد من تحرير القفل عند حدوث خطأ فادح هنا
+                    isWiseHawkHunting = false; 
                 } finally {
-                     potentialTrades.delete(tokenAddress); // إزالة من قائمة المراقبة بعد محاولة الشراء
+                     potentialTrades.delete(tokenAddress); 
                 }
-                 // --- نهاية الخطوة 2 ---
-
-            } // نهاية حلقة for
+            } 
 
         } catch (error) {
             logger.error(`❌ خطأ حلقة المعالج الرئيسية: ${error.message}`, error);
         } finally {
-            processedPairs.clear(); // مسح علامات "قيد المعالجة"
+            processedPairs.clear(); 
         }
 
-        await sleep(10 * 1000); // فحص القائمة كل 10 ثواني
+        await sleep(5 * 1000); // فحص القائمة كل 5 ثواني
     }
 }
 
@@ -446,8 +531,9 @@ async function processPotentialTrades() {
 // 7. الدالة الرئيسية (Main)
 // =================================================================
 async function main() {
-    logger.info(`--- بدء تشغيل (v13.2 - بروتوكول صياد الأنهار) ---`);
+    logger.info(`--- بدء تشغيل (v14.0 - بروتوكول مراقب البلوكتشين) ---`);
     try {
+        // المزود الرئيسي (للمعاملات والفحص)
         provider = new ethers.JsonRpcProvider(config.PROTECTED_RPC_URL);
         wallet = new ethers.Wallet(config.PRIVATE_KEY, provider);
         routerContract = new ethers.Contract(config.ROUTER_ADDRESS, ROUTER_ABI, wallet);
@@ -455,7 +541,7 @@ async function main() {
         loadTradesFromFile(); logger.info(`💾 تم تحميل ${activeTrades.length} صفقة نشطة.`);
         const network = await provider.getNetwork(); logger.info(`✅ متصل بـ (RPC: ${network.name}, ID: ${network.chainId})`);
 
-        const welcomeMsg = `✅ <b>صياد الأنهار (v13.2) بدأ!</b>\n(فلترة مزدوجة للعمر)`;
+        const welcomeMsg = `✅ <b>مراقب البلوكتشين (v14.0) بدأ!</b>`;
         await telegram.sendMessage(config.TELEGRAM_ADMIN_CHAT_ID, welcomeMsg, { parse_mode: 'HTML', reply_markup: getMainMenuKeyboard() });
 
         // --- معالجات التليجرام ---
@@ -465,13 +551,17 @@ async function main() {
                 const settingKey = userState[chatId].awaiting; delete userState[chatId]; const valueStr = msg.text.trim();
                 try {
                     let newValue;
-                    if (['BUY_AMOUNT_BNB', 'MINIMUM_LIQUIDITY_BNB', 'MIN_LOCKED_LIQUIDITY_PERCENT', 'MAX_TOP_HOLDERS_PERCENT', 'MAX_CREATOR_PERCENT'].includes(settingKey)) {
+                    if (['BUY_AMOUNT_BNB', 'MINIMUM_LIQUIDITY_BNB', 'MIN_LIQUIDITY_ADD_BNB', 'MIN_LOCKED_LIQUIDITY_PERCENT', 'MAX_TOP_HOLDERS_PERCENT', 'MAX_CREATOR_PERCENT'].includes(settingKey)) {
                         newValue = parseFloat(valueStr);
                     } else { 
                         newValue = parseInt(valueStr, 10);
                     }
                     if (isNaN(newValue) || newValue < 0) throw new Error("قيمة غير صالحة");
                     config[settingKey] = newValue; logger.info(`⚙️ ${settingKey} -> ${newValue}.`);
+                    // تحديث قيمة الحد الأدنى للسيولة (Wei) إذا تم تغييرها
+                    if (settingKey === 'MIN_LIQUIDITY_ADD_BNB') {
+                        minLiquidityWei = ethers.parseEther(newValue.toString());
+                    }
                     await telegram.sendMessage(chatId, `✅ <b>${settingKey}</b> -> <code>${newValue}</code>`, { parse_mode: 'HTML', reply_markup: getMainMenuKeyboard() });
                 } catch { await telegram.sendMessage(chatId, "❌ قيمة غير صالحة.", { reply_markup: getMainMenuKeyboard() }); } return;
             }
@@ -492,7 +582,7 @@ async function main() {
         });
 
         // --- بدء العمليات الخلفية ---
-        scanForRiverGems(); // <<<--- استدعاء الماسح الجديد (v13.2)
+        monitorBlockchain(); // <<<--- استدعاء المراقب الجديد v14.0
         processPotentialTrades(); 
         setInterval(monitorTrades, 2000); 
 
@@ -504,7 +594,7 @@ async function main() {
 }
 
 // =================================================================
-// 8. دوال واجهة التليجرام (Telegram UI) - [تحديث v13.2]
+// 8. دوال واجهة التليجرام (Telegram UI) - [تحديث v14.0]
 // =================================================================
 function getMainMenuKeyboard() {
     const pauseButtonText = config.IS_PAUSED ? "▶️ استئناف البحث" : "⏸️ إيقاف البحث";
@@ -520,7 +610,7 @@ function getMainMenuKeyboard() {
     };
  }
 async function showStatus(chatId) {
-    let statusText = `<b>📊 الحالة (v13.2 - صياد الأنهار):</b>\n\n`; // <-- تحديث الإصدار
+    let statusText = `<b>📊 الحالة (v14.0 - مراقب البلوكتشين):</b>\n\n`; // <-- تحديث الإصدار
     statusText += `<b>البحث:</b> ${config.IS_PAUSED ? 'موقوف⏸️' : 'نشط▶️'} | <b>تصحيح:</b> ${config.DEBUG_MODE ? 'فعّال🟢' : 'OFF⚪️'}\n`;
     statusText += `<b>شراء:</b> ${isWiseHawkHunting ? 'مشغول🦅' : 'جاهز'} | <b>مرشحين:${potentialTrades.size}</b>\n-----------------------------------\n`;
     let bnbBalance = 0; try { bnbBalance = parseFloat(ethers.formatEther(await provider.getBalance(config.WALLET_ADDRESS))); } catch (e) { logger.error(`[Status] خطأ رصيد BNB: ${e.message}`); }
@@ -535,10 +625,8 @@ async function showStatus(chatId) {
     }
     statusText += "-----------------------------------\n<b>⚙️ الإعدادات الحالية:</b>\n";
     statusText += `- شراء:${config.BUY_AMOUNT_BNB} BNB | وقف:${config.TRAILING_STOP_LOSS_PERCENT}% | TP:${config.PARTIAL_TP_PERCENT}%(${config.PARTIAL_TP_SELL_PERCENT}%)\n`;
-    // --- تحديث v13.2: عرض إعدادات الماسح ---
-    statusText += `<b>🎣 فلاتر المسح:</b> (كل ${config.SCAN_INTERVAL_SECONDS} ث)\n`;
-    statusText += `- عمر: ${config.MIN_AGE_MINUTES}د - ${config.MAX_AGE_HOURS}س\n`;
-    statusText += `- سيولة: $${config.MIN_LIQUIDITY_USD} | حجم/س: $${config.MIN_VOLUME_H1}\n`;
+    // --- تحديث v14.0: عرض إعدادات المراقب ---
+    statusText += `<b>🛰️ فلتر المراقب:</b> (سيولة مضافة > ${config.MIN_LIQUIDITY_ADD_BNB} BNB)\n`;
     // --- نهاية التحديث ---
     statusText += `<b>🛡️ الدرع:</b> قفل:${config.MIN_LOCKED_LIQUIDITY_PERCENT}%|حيتان:${config.MAX_TOP_HOLDERS_PERCENT}%|مطور:${config.MAX_CREATOR_PERCENT}%|تخلي:${config.REQUIRE_OWNERSHIP_RENOUNCED ? '✅' : '❌'}`;
     await telegram.sendMessage(chatId, statusText, { parse_mode: 'HTML', reply_markup: getMainMenuKeyboard() });
@@ -563,24 +651,19 @@ function showDiagnostics(chatId) {
     });
  }
 
-// --- تحديث v13.2: واجهة الإعدادات ---
+// --- تحديث v14.0: واجهة الإعدادات ---
 function showSettingsMenu(chatId) {
     const keyboard = [
         // الشراء والغاز
         [{ text: `💵 شراء (${config.BUY_AMOUNT_BNB})`, callback_data: 'change_BUY_AMOUNT_BNB' }, { text: `🚀 غاز (${config.GAS_PRIORITY_MULTIPLIER}x)`, callback_data: 'change_GAS_PRIORITY_MULTIPLIER' }],
-        // الانزلاق وسيولة BNB (للأمان)
-        [{ text: `📊 انزلاق (${config.SLIPPAGE_LIMIT}%)`, callback_data: 'change_SLIPPAGE_LIMIT' }, { text: `💧 سيولة BNB (${config.MINIMUM_LIQUIDITY_BNB})`, callback_data: 'change_MINIMUM_LIQUIDITY_BNB' }],
+        [{ text: `📊 انزلاق (${config.SLIPPAGE_LIMIT}%)`, callback_data: 'change_SLIPPAGE_LIMIT' }],
         // إدارة الصفقة
         [{ text: `📈 وقف متحرك (${config.TRAILING_STOP_LOSS_PERCENT}%)`, callback_data: 'change_TRAILING_STOP_LOSS_PERCENT' }],
         [{ text: `🎯 TP هدف (${config.PARTIAL_TP_PERCENT}%)`, callback_data: 'change_PARTIAL_TP_PERCENT' }, { text: `💰 TP بيع (${config.PARTIAL_TP_SELL_PERCENT}%)`, callback_data: 'change_PARTIAL_TP_SELL_PERCENT' }],
         
-        // --- فلاتر المسح (v13.2) ---
-        [{ text: `⏱️ فاصل المسح (${config.SCAN_INTERVAL_SECONDS} ث)`, callback_data: 'change_SCAN_INTERVAL_SECONDS' }],
-        [{ text: `⏳ عمر أدنى (${config.MIN_AGE_MINUTES} د)`, callback_data: 'change_MIN_AGE_MINUTES' }, { text: `⌛ عمر أقصى (${config.MAX_AGE_HOURS} س)`, callback_data: 'change_MAX_AGE_HOURS' }],
-        [{ text: `💧 مسح سيولة USD ($${config.MIN_LIQUIDITY_USD})`, callback_data: 'change_MIN_LIQUIDITY_USD' }],
-        [{ text: `📊 مسح حجم/س ($${config.MIN_VOLUME_H1})`, callback_data: 'change_MIN_VOLUME_H1' }],
-
-        // --- قسم الدرع الفولاذي ---
+        // --- فلاتر المراقب والدرع (v14.0) ---
+        [{ text: `🛰️ فلتر سيولة المراقب (${config.MIN_LIQUIDITY_ADD_BNB} BNB)`, callback_data: 'change_MIN_LIQUIDITY_ADD_BNB' }],
+        [{ text: `💧 فحص سيولة BNB (${config.MINIMUM_LIQUIDITY_BNB} BNB)`, callback_data: 'change_MINIMUM_LIQUIDITY_BNB' }],
         [{ text: `🔒 قفل سيولة (${config.MIN_LOCKED_LIQUIDITY_PERCENT}%)`, callback_data: 'change_MIN_LOCKED_LIQUIDITY_PERCENT' }],
         [{ text: `🐳 حيتان (${config.MAX_TOP_HOLDERS_PERCENT}%)`, callback_data: 'change_MAX_TOP_HOLDERS_PERCENT' }, { text: `👨‍💻 مطور (${config.MAX_CREATOR_PERCENT}%)`, callback_data: 'change_MAX_CREATOR_PERCENT' }],
     ];
@@ -598,7 +681,7 @@ function showSellPercentageMenu(chatId, messageId, tokenAddress) {
         [{ text: "25%", callback_data: `partial_sell_25_${tokenAddress}` }, { text: "50%", callback_data: `partial_sell_50_${tokenAddress}` }],
         [{ text: "100%", callback_data: `partial_sell_100_${tokenAddress}` }]
     ];
-    telegram.editMessageText(`<b>اختر نسبة البيع لـ <code>${tokenAddress.slice(0,10)}...</code>:</b>`, { parse_mode: "HTML", reply_markup: { inline_keyboard: keyboard } });
+    telegram.editMessageText(`<b>اختر نسبة البيع لـ <code>${tokenAddress.slice(0,10)}...</code>:</b>`, { chat_id: chatId, message_id: messageId, parse_mode: "HTML", reply_markup: { inline_keyboard: keyboard } });
 }
 
 // --- معالجة أخطاء التليجرام العامة ---
