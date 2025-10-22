@@ -1,5 +1,5 @@
 // =================================================================
-// صياد الدرر: v10.1 (إصلاح خطأ 404 - الرجوع للرابط الأصلي)
+// صياد الدرر: v10.2 (إصلاح الراصد باستخدام "Search" API)
 // =================================================================
 import { ethers } from 'ethers';
 import dotenv from 'dotenv';
@@ -148,7 +148,7 @@ async function fullCheck(pairAddress, tokenAddress) {
         const amountIn = ethers.parseUnits("1", decimals);
         await routerContract.getAmountsOut.staticCall(amountIn, [tokenAddress, config.WBNB_ADDRESS]);
         logger.info(` -> ✅ فحص شامل ناجح.`);
-        return { passed: true, reason: "اجتاز الفحص الشامل (v10.1)" };
+        return { passed: true, reason: "اجتاز الفحص الشامل (v10.2)" };
     } catch (error) {
         const isHoneypot = error.message.includes('INSUFFICIENT_OUTPUT_AMOUNT') || error.message.includes('TRANSFER_FROM_FAILED') || error.code === 'CALL_EXCEPTION';
         const reason = isHoneypot ? `فخ عسل (محاكاة فشلت)` : `فشل فحص غير متوقع`;
@@ -248,25 +248,31 @@ function removeTrade(tradeToRemove) { const i = activeTrades.findIndex(t => t.to
 
 
 // =================================================================
-// 6. الراصد ونقطة الانطلاق (v10.1 - إصلاح الـ 404)
+// 6. الراصد ونقطة الانطلاق (v10.2 - إصلاح الراصد باستخدام "Search")
 // =================================================================
 /**
- * جلب وفلترة العملات الجديدة من DexScreener (v10.1)
+ * جلب وفلترة العملات الجديدة من DexScreener (v10.2)
  */
 async function fetchTrendingPairs() {
     if (config.IS_PAUSED) { logger.info('🛑 البوت متوقف.'); return []; }
     try {
-        // --- بداية الإصلاح v10.1: إصلاح خطأ 404 ---
-        // الرجوع إلى الرابط الأصلي من v9.7 الذي كان يعمل
-        // هذا الرابط يجلب "أشهر" أزواج WBNB، وليس "أحدثها"
-        const url = `https://api.dexscreener.com/latest/dex/tokens/${config.WBNB_ADDRESS}`;
-        logger.info(`📡 جلب أزواج WBNB...`);
-        // --- نهاية الإصلاح v10.1 ---
+        // --- بداية الإصلاح v10.2: استخدام نقطة نهاية "البحث" ---
+        // سنبحث عن الأزواج التي تحتوي على WBNB على شبكة BSC
+        // ونضيف بارامترات لمحاولة ترتيبها حسب تاريخ الإنشاء
+        const url = `https://api.dexscreener.com/latest/dex/search?q=WBNB%20bsc&orderBy=pairCreatedAt&order=desc`;
+        
+        logger.info(`📡 جلب أزواج WBNB (باستخدام البحث v10.2)...`);
+        // --- نهاية الإصلاح v10.2 ---
         
         const response = await axios.get(url, { headers: { 'Accept': 'application/json' }, timeout: 10000 });
 
         if (response.data && response.data.pairs) {
-            const allPairs = response.data.pairs;
+            let allPairs = response.data.pairs;
+
+            // احتياطي: إذا لم يقم الـ API بالترتيب (وهو الغالب)، نرتبها هنا
+            // نرتب تنازليًا (الأحدث أولاً)
+            allPairs.sort((a, b) => (b.pairCreatedAt || 0) - (a.pairCreatedAt || 0));
+
             const filteredPairs = allPairs.filter(pair => {
                 // فحص أولي لوجود البيانات الأساسية
                 if (!pair || !pair.pairCreatedAt || !pair.chainId || pair.chainId !== 'bsc' || !pair.baseToken || !pair.baseToken.address || !pair.quoteToken || !pair.quoteToken.address) return false;
@@ -283,7 +289,9 @@ async function fetchTrendingPairs() {
                     tokenAddress = pair.baseToken.address;
                     tokenSymbol = pair.baseToken.symbol;
                 } else {
-                    return false; // ليس زوج WBNB (مثل BUSD/USDT)
+                    // إذا كان البحث دقيقًا، يجب أن يكون WBNB موجودًا
+                    // ولكن كأمان، نرفض الأزواج التي لا تحتوي على WBNB
+                    return false; 
                 }
                 // --- نهاية (v9.9) ---
 
@@ -298,8 +306,7 @@ async function fetchTrendingPairs() {
                     try { createdAtMs = parseInt(pair.pairCreatedAt, 10); if (isNaN(createdAtMs)) throw new Error('Invalid timestamp string'); }
                     catch (e) { logger.error(`[خطأ عمر] فشل تحويل pairCreatedAt النصي: ${pair.pairCreatedAt} لـ ${tokenAddress.slice(0,10)}`); return false; }
                 } else {
-                    logger.error(`[خطأ عمر] نوع pairCreatedAt غير متوقع: ${typeof pair.pairCreatedAt} لـ ${tokenAddress.slice(0,10)}`); return false;
-                }
+                    logger.error(`[خطأ عمر] نوع pairCreatedAt غير متوقع: ${typeof pair.pairCreatedAt} لـ ${tokenAddress.slice(0,10)}`); return false; }
 
                 // حساب العمر الصحيح الآن
                 const ageMs = Date.now() - createdAtMs;
@@ -333,13 +340,16 @@ async function fetchTrendingPairs() {
                 return true;
             });
 
-            filteredPairs.sort((a, b) => a.pairCreatedAt - b.pairCreatedAt);
+            // filteredPairs.sort((a, b) => a.pairCreatedAt - b.pairCreatedAt); // تم تغيير الترتيب للأحدث
             lastPairsFound = filteredPairs.length;
             logger.info(`✅ ${lastPairsFound} هدف WBNB مطابق للمعايير الأولية (من ${allPairs.length} زوج).`);
-            return filteredPairs;
+            
+            // نعكس الترتيب ليتم معالجة الأقدم (المطابق للشروط) أولاً
+            return filteredPairs.reverse();
+
         }
-        lastPairsFound = 0; logger.warn(`⚠️ لم يتم العثور على أزواج WBNB.`); return [];
-    } catch (error) { logger.error(`❌ خطأ DexScreener: ${error.message}`); lastPairsFound = 0; return []; }
+        lastPairsFound = 0; logger.warn(`⚠️ لم يتم العثور على أزواج WBNB (نتائج البحث).`); return [];
+    } catch (error) { logger.error(`❌ خطأ DexScreener (Search): ${error.message}`); lastPairsFound = 0; return []; }
 }
 
 /**
@@ -360,7 +370,7 @@ async function processNewTarget(pair) {
         tokenAddress = pair.baseToken.address;
         tokenSymbol = pair.baseToken.symbol;
     } else {
-        return; // ليس زوج WBNB (هذا نظريًا لن يحدث لأن fetchTrendingPairs فلترته)
+        return; 
     }
     // --- نهاية الإصلاح 1 ---
 
@@ -401,7 +411,7 @@ async function processNewTarget(pair) {
 
 
 async function pollForMomentum() {
-    logger.info("🚀 [راصد الزخم الآمن] بدأ (v10.1).");
+    logger.info("🚀 [راصد الزخم الآمن] بدأ (v10.2).");
     while (true) {
         try {
             const pairs = await fetchTrendingPairs();
@@ -418,14 +428,14 @@ async function pollForMomentum() {
 // 7. الدالة الرئيسية (Main)
 // =================================================================
 async function main() {
-    logger.info(`--- بدء تشغيل (v10.1 - إصلاح 404) ---`);
+    logger.info(`--- بدء تشغيل (v10.2 - إصلاح Search) ---`);
     try {
         provider = new ethers.JsonRpcProvider(config.PROTECTED_RPC_URL);
         wallet = new ethers.Wallet(config.PRIVATE_KEY, provider);
         routerContract = new ethers.Contract(config.ROUTER_ADDRESS, ROUTER_ABI, wallet);
         loadTradesFromFile(); logger.info(`💾 ${activeTrades.length} صفقة محملة.`);
         const network = await provider.getNetwork(); logger.info(`✅ متصل بـ (${network.name}, ID: ${network.chainId})`);
-        const welcomeMsg = `✅ <b>راصد الزخم الآمن (v10.1) بدأ!</b>`;
+        const welcomeMsg = `✅ <b>راصد الزخم الآمن (v10.2) بدأ!</b>`;
         await telegram.sendMessage(config.TELEGRAM_ADMIN_CHAT_ID, welcomeMsg, { parse_mode: 'HTML', reply_markup: getMainMenuKeyboard() });
 
         telegram.on('message', async (msg) => {
@@ -481,7 +491,7 @@ function getMainMenuKeyboard() {
 }
 
 async function showStatus(chatId) {
-    let statusText = `<b>📊 الحالة (v10.1):</b>\n\n`; // تحديث الإصدار
+    let statusText = `<b>📊 الحالة (v10.2):</b>\n\n`; // تحديث الإصدار
     statusText += `<b>البحث:</b> ${config.IS_PAUSED ? 'موقوف⏸️' : 'نشط▶️'} | <b>تصحيح:</b> ${config.DEBUG_MODE ? 'فعّال🟢' : 'OFF⚪️'}\n`;
     statusText += `<b>شراء:</b> ${isWiseHawkHunting ? 'مشغول🦅' : 'جاهز'} | <b>أهداف:${lastPairsFound}</b>\n-----------------------------------\n`;
     let bnbBalance = 0; try { bnbBalance = parseFloat(ethers.formatEther(await provider.getBalance(config.WALLET_ADDRESS))); } catch (e) { logger.error(`[Status] خطأ رصيد BNB: ${e.message}`); }
