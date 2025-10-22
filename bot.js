@@ -256,17 +256,42 @@ async function fetchTrendingPairs() {
         const url = `https://api.dexscreener.com/latest/dex/tokens/${config.WBNB_ADDRESS}`;
         logger.info(`📡 جلب أزواج WBNB...`);
         const response = await axios.get(url, { headers: { 'Accept': 'application/json' }, timeout: 10000 });
+
         if (response.data && response.data.pairs) {
             const allPairs = response.data.pairs;
             const filteredPairs = allPairs.filter(pair => {
                 if (!pair || !pair.pairCreatedAt || !pair.chainId || pair.chainId !== 'bsc' || !pair.baseToken || !pair.baseToken.address) return false;
-                const ageMinutes = (Date.now() - (pair.pairCreatedAt * 1000)) / (1000 * 60);
-                if (ageMinutes < config.MIN_AGE_MINUTES || ageMinutes > (config.MAX_AGE_HOURS * 60)) { if (config.DEBUG_MODE) logger.info(`[فلتر] رفض ${pair.baseToken.address.slice(0,10)}: عمر ${ageMinutes.toFixed(1)} د`); return false; }
-                const liquidityUsd = pair.liquidity?.usd || 0; if (liquidityUsd < config.MIN_LIQUIDITY_USD) { if (config.DEBUG_MODE) logger.info(`[فلتر] رفض ${pair.baseToken.address.slice(0,10)}: سيولة $${liquidityUsd.toFixed(0)}`); return false; }
-                const volumeH1 = pair.volume?.h1 || 0; if (volumeH1 < config.MIN_VOLUME_H1) { if (config.DEBUG_MODE) logger.info(`[فلتر] رفض ${pair.baseToken.address.slice(0,10)}: حجم $${volumeH1.toFixed(0)}/س`); return false; }
-                const txnsH1 = pair.txns?.h1 || {}; const totalTxns = (txnsH1.buys || 0) + (txnsH1.sells || 0); if (totalTxns < config.MIN_TXNS_H1) { if (config.DEBUG_MODE) logger.info(`[فلتر] رفض ${pair.baseToken.address.slice(0,10)}: معاملات ${totalTxns}/س`); return false; }
+
+                // ===== <<< إصلاح v9.8: حساب العمر الصحيح >>> =====
+                // pair.pairCreatedAt يأتي بالثواني، نحوله إلى مللي ثانية للمقارنة مع Date.now()
+                const createdAtMs = pair.pairCreatedAt * 1000;
+                const ageMs = Date.now() - createdAtMs;
+                const ageMinutes = ageMs / (1000 * 60);
+                // ===============================================
+
+                if (ageMinutes < config.MIN_AGE_MINUTES || ageMinutes > (config.MAX_AGE_HOURS * 60)) {
+                    if (config.DEBUG_MODE) logger.info(`[فلتر] رفض ${pair.baseToken.address.slice(0,10)}: عمر ${ageMinutes.toFixed(1)} د`);
+                    return false;
+                }
+                const liquidityUsd = pair.liquidity?.usd || 0;
+                if (liquidityUsd < config.MIN_LIQUIDITY_USD) {
+                    if (config.DEBUG_MODE) logger.info(`[فلتر] رفض ${pair.baseToken.address.slice(0,10)}: سيولة $${liquidityUsd.toFixed(0)}`);
+                    return false;
+                }
+                const volumeH1 = pair.volume?.h1 || 0;
+                if (volumeH1 < config.MIN_VOLUME_H1) {
+                    if (config.DEBUG_MODE) logger.info(`[فلتر] رفض ${pair.baseToken.address.slice(0,10)}: حجم $${volumeH1.toFixed(0)}/س`);
+                    return false;
+                }
+                const txnsH1 = pair.txns?.h1 || {};
+                const totalTxns = (txnsH1.buys || 0) + (txnsH1.sells || 0);
+                if (totalTxns < config.MIN_TXNS_H1) {
+                    if (config.DEBUG_MODE) logger.info(`[فلتر] رفض ${pair.baseToken.address.slice(0,10)}: معاملات ${totalTxns}/س`);
+                    return false;
+                }
                 return true;
             });
+
             filteredPairs.sort((a, b) => a.pairCreatedAt - b.pairCreatedAt);
             lastPairsFound = filteredPairs.length;
             logger.info(`✅ ${lastPairsFound} هدف مطابق للمعايير الأولية (من ${allPairs.length}).`);
