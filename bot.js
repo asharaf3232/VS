@@ -514,28 +514,32 @@ function updateWalletScore(walletAddress, profit) {
 // 6. الراصد ونقطة الانطلاق (v15.3 - بروتوكول متتبع المحافظ)
 // =================================================================
 
+// [جديد v15.3 - تعديل للتحكم في الضغط]
+const pendingTxQueue = [];
+let isProcessingQueue = false;
+const MAX_CONCURRENT_CHECKS = 5; // عدد المعاملات التي نفحصها في نفس الوقت (قلل هذا الرقم إذا استمر الخطأ)
+const CHECK_INTERVAL_MS = 1000; // فاصل زمني بين كل دفعة فحص (بالمللي ثانية)
+
 /**
  * [معدل v15.3] معالج المعاملات التي تم تتبعها
- * يقوم بفك تشفير المعاملة وتمريرها
+ * الآن يُستدعى بشكل متحكم فيه من قائمة الانتظار
  */
 async function processTrackedTransaction(txHash) {
-    // [جديد v15.3] منع معالجة نفس الهاش عدة مرات
-    if (processedTxs.has(txHash)) return;
-    processedTxs.add(txHash);
-    // تنظيف القائمة بشكل دوري
-    if (processedTxs.size > 1000) processedTxs.clear();
+    // ... (نفس الكود من v15.3 بدون تغيير) ...
+    // [تعديل بسيط v15.3] لا نضع processedTxs هنا، نضعها عند الإضافة للقائمة
+    // if (processedTxs.has(txHash)) return; 
+    // processedTxs.add(txHash);
 
     let tx;
     try {
-        tx = await listenerProvider.getTransaction(txHash);
+        // [تعديل v15.3] نستخدم المزود الرئيسي (provider) للفحص لأنه قد يكون أسرع أو له حدود مختلفة
+        tx = await provider.getTransaction(txHash); 
         
         if (!tx || !tx.to || !tx.from || !tx.data || tx.data === '0x') {
             return;
         }
 
         const fromAddress = tx.from.toLowerCase();
-        
-        // [تعديل v15.2] البحث في قائمة الكائنات
         const trackedWallet = config.TRACKED_WALLETS.find(w => w.address === fromAddress);
 
         if (trackedWallet && tx.to.toLowerCase() === config.ROUTER_ADDRESS.toLowerCase())
@@ -561,42 +565,90 @@ async function processTrackedTransaction(txHash) {
             }
         }
     } catch (error) {
-        if (error.code !== 'TRANSACTION_REPLACED' && error.code !== 'TIMEOUT' && !error.message.includes('transaction not found')) {
+        // [تعديل v15.3] تجاهل أخطاء الحد الأقصى للطلبات هنا بهدوء أكبر
+        if (error.code === -32005) { // Rate limit error
+             if(config.DEBUG_MODE) logger.warn(`[متتبع] تجاوز الحد الأقصى للطلبات أثناء فحص ${txHash.slice(0,10)}. سيتم إعادة المحاولة لاحقاً.`);
+             // إعادة الهاش إلى بداية القائمة للمحاولة مرة أخرى
+             pendingTxQueue.unshift(txHash); 
+        } else if (error.code !== 'TRANSACTION_REPLACED' && error.code !== 'TIMEOUT' && !error.message.includes('transaction not found')) {
             logger.error(`[متتبع] ❌ خطأ فادح في معالجة ${txHash}: ${error.message}`);
+        }
+    }
+}
+
+// [جديد v15.3] دالة معالجة قائمة الانتظار
+async function processQueue() {
+    if (isProcessingQueue || pendingTxQueue.length === 0) {
+        return;
+    }
+    isProcessingQueue = true;
+
+    const itemsToProcess = pendingTxQueue.splice(0, MAX_CONCURRENT_CHECKS);
+    if(config.DEBUG_MODE) logger.info(`[Queue] جاري معالجة ${itemsToProcess.length} معاملة... (متبقي ${pendingTxQueue.length})`);
+
+    try {
+        const promises = itemsToProcess.map(txHash => processTrackedTransaction(txHash));
+        await Promise.allSettled(promises);
+    } catch (e) {
+         logger.error(`[Queue] خطأ أثناء معالجة الدفعة: ${e.message}`);
+    } finally {
+        isProcessingQueue = false;
+        // استدعاء الدالة مرة أخرى فوراً إذا كانت القائمة لا تزال تحتوي على عناصر
+        if (pendingTxQueue.length > 0) {
+            // استخدام setTimeout(0) لمنع استهلاك المكدس (stack overflow)
+            setTimeout(processQueue, 0); 
         }
     }
 }
 
 
 /**
- * [معدل v15.1] المستمع الرئيسي للبلوكتشين (متتبع المحافظ)
+ * [معدل v15.3] المستمع الرئيسي للبلوكتشين (متتبع المحافظ)
  */
 async function startWalletScanner() {
     logger.info("🚀 [متتبع v15.3] بدء حلقة الاتصال...");
     
-    if (!config.NODE_URL || !config.NODE_URL.startsWith('ws')) {
+    // ... (نفس كود التحقق من NODE_URL والتأكد من قائمة المحافظ) ...
+     if (!config.NODE_URL || !config.NODE_URL.startsWith('ws')) {
         logger.error(`[خطأ متتبع] NODE_URL يجب أن يكون رابط WebSocket (wss://)`);
         process.exit(1);
     }
-    
+    if (config.TRACKED_WALLETS.length === 0) {
+        logger.warn(`[متتبع] ⚠️ قائمة TRACKED_WALLETS فارغة. قم بإضافة محافظ عبر التليجرام.`);
+    } else {
+         logger.info(`[متتبع] 🎯 يراقب ${config.TRACKED_WALLETS.length} محافظ ذكية.`);
+    }
+
     let reconnectDelay = 5000;
-    const maxDelay = 300000; // 5 دقائق
+    const maxDelay = 300000; 
+
+    // [جديد v15.3] تشغيل معالج القائمة بشكل دوري
+    setInterval(processQueue, CHECK_INTERVAL_MS);
 
     while (true) {
         try {
             logger.info(`🔌 [متتبع] محاولة الاتصال بـ WebSocket (${config.NODE_URL})...`);
             listenerProvider = new ethers.WebSocketProvider(config.NODE_URL);
-            await provider.getNetwork(); // التأكد من المزود الرئيسي
-            
-            if (config.TRACKED_WALLETS.length === 0) {
-                 logger.warn(`[متتبع] ⚠️ قائمة المراقبة فارغة. قم بإضافة محافظ عبر التليجرام.`);
-            } else {
-                 logger.info(`[متتبع] 🎯 يراقب ${config.TRACKED_WALLETS.length} محافظ ذكية.`);
-            }
+            await provider.getNetwork(); 
 
             logger.info("✅ [متتبع] تم الاتصال بـ WebSocket. بدء الاستماع للمعاملات المعلقة (Pending)...");
             
-            listenerProvider.on('pending', processTrackedTransaction);
+            // [تعديل v15.3] بدلاً من المعالجة الفورية، نضيف إلى قائمة الانتظار
+            listenerProvider.on('pending', (txHash) => {
+                if (!processedTxs.has(txHash)) {
+                    processedTxs.add(txHash);
+                    // تنظيف القائمة بشكل دوري
+                    if (processedTxs.size > 5000) { // زيادة الحجم قليلاً
+                        const oldSize = processedTxs.size;
+                        const arr = Array.from(processedTxs).slice(-2000); // الاحتفاظ بآخر 2000
+                        processedTxs.clear();
+                        arr.forEach(item => processedTxs.add(item));
+                        logger.info(`[Cache] تم تنظيف processedTxs من ${oldSize} إلى ${processedTxs.size}`);
+                    }
+                    pendingTxQueue.push(txHash);
+                     // لا نستدعي processQueue هنا، نعتمد على المؤقت الدوري
+                }
+            });
 
             reconnectDelay = 5000; 
 
@@ -627,6 +679,8 @@ async function startWalletScanner() {
                 }
             }
             listenerProvider = null;
+            pendingTxQueue.length = 0; // مسح القائمة عند إعادة الاتصال
+            isProcessingQueue = false;
             logger.info(`🔌 [متتبع] المحاولة مرة أخرى بعد ${reconnectDelay / 1000} ثانية...`);
             await sleep(reconnectDelay);
             reconnectDelay = Math.min(reconnectDelay * 2, maxDelay);
@@ -634,10 +688,11 @@ async function startWalletScanner() {
     }
 }
 
+// ... (باقي الدوال handleTrackedToken, processPotentialTrades, main, ودوال التليجرام تبقى كما هي في v15.3) ...
+// تأكد من أن هذه الدوال موجودة في ملفك.
 
 /**
  * [معدل v15.2] معالج العثور على الزوج
- * الآن يمرر "المحفظة المصدر"
  */
 function handleTrackedToken(tokenAddress, pairAddress, triggeredByWallet) {
     if (config.IS_PAUSED) return;
@@ -651,14 +706,13 @@ function handleTrackedToken(tokenAddress, pairAddress, triggeredByWallet) {
     potentialTrades.set(tokenAddress, { 
         pairAddress: pairAddress, 
         foundAt: Date.now(), 
-        triggeredBy: triggeredByWallet // [جديد v15.2]
+        triggeredBy: triggeredByWallet 
     });
 }
 
 
 /**
  * [معدل v15.2] معالج قائمة المرشحين
- * الآن يمرر "المحفظة المصدر" إلى دالة الشراء
  */
 async function processPotentialTrades() {
     logger.info(`[معالج v15.3] بدأ. (مراقبة قائمة الفحص الأمني)`);
@@ -672,11 +726,11 @@ async function processPotentialTrades() {
 
             for (const [tokenAddress, data] of potentialTrades.entries()) {
                 
-                // [تعديل v15.3] نستخدم عنوان العملة بدلاً من الزوج لمنع إعادة المعالجة
-                if (processedTxs.has(tokenAddress)) {
+                // [تعديل v15.3] نستخدم Set منفصل للمرشحين قيد المعالجة
+                if (processedTxs.has("potential_"+tokenAddress)) { 
                     continue; 
                 }
-                processedTxs.add(tokenAddress);
+                processedTxs.add("potential_"+tokenAddress);
 
                 logger.info(`\n\n[معالج] ${tokenAddress.slice(0,10)}. بدء الفحص الأمني العميق...`);
                 
@@ -684,14 +738,15 @@ async function processPotentialTrades() {
                 if (!securityCheck.passed) {
                     logger.warn(`[معالج] ❌ ${tokenAddress.slice(0,10)} - ${securityCheck.reason}. إزالة.`);
                     potentialTrades.delete(tokenAddress); 
-                     if (config.DEBUG_MODE) await telegram.sendMessage(config.TELEGRAM_ADMIN_CHAT_ID, `<b>❌ مرفوض (فحص أمني)</b>\n<code>${tokenAddress}</code>\n<b>السبب:</b> ${securityCheck.reason}`, { parse_mode: 'HTML' });
+                    processedTxs.delete("potential_"+tokenAddress); // إزالة من المعالجة للسماح بفحص آخر إذا كان الخطأ مؤقتًا
+                    if (config.DEBUG_MODE) await telegram.sendMessage(config.TELEGRAM_ADMIN_CHAT_ID, `<b>❌ مرفوض (فحص أمني)</b>\n<code>${tokenAddress}</code>\n<b>السبب:</b> ${securityCheck.reason}`, { parse_mode: 'HTML' });
                     continue; 
                 }
                 
                 logger.info(`[معالج] -> الخطوة 2: الانقضاض...`);
                 if (isWiseHawkHunting) {
                     logger.info(`⏳ ${tokenAddress.slice(0,10)} ينتظر (البوت مشغول بشراء آخر).`);
-                    processedTxs.delete(tokenAddress); // السماح بإعادة المحاولة
+                    processedTxs.delete("potential_"+tokenAddress); // السماح بإعادة المحاولة
                     continue;
                 }
                 isWiseHawkHunting = true; 
@@ -699,27 +754,32 @@ async function processPotentialTrades() {
                 await telegram.sendMessage(config.TELEGRAM_ADMIN_CHAT_ID, `<b>🚀 فرصة مؤكدة! (v15.3)</b>\n<code>${tokenAddress}</code>\n✅ رُصدت من ${data.triggeredBy.slice(0,6)}... واجتازت الفحص.\n⏳ شراء ${config.DRY_RUN_MODE ? '(تجريبي 🟢)' : '(حقيقي 🔴)'}...`, { parse_mode: 'HTML' });
 
                 try {
-                    // [تعديل v15.2] تمرير المحفظة المصدر
                     await snipeToken(data.pairAddress, tokenAddress, data.triggeredBy); 
                 } catch (e) {
                     logger.error(`Error during snipeToken call: ${e}`);
                     isWiseHawkHunting = false; 
                 } finally {
                      potentialTrades.delete(tokenAddress); 
+                     // لا نزيل "potential_" + tokenAddress من processedTxs هنا، لأنه تمت محاولة الشراء بالفعل
                 }
             } 
 
         } catch (error) {
             logger.error(`❌ خطأ حلقة المعالج الرئيسية: ${error.message}`, error);
         } finally {
-             // [تعديل v15.3] مسح القائمة بشكل دوري وليس كل مرة
-             if (processedTxs.size > 1000) processedTxs.clear();
+             // تنظيف processedTxs بشكل دوري (كما في startWalletScanner)
+             if (processedTxs.size > 5000) { 
+                const oldSize = processedTxs.size;
+                const arr = Array.from(processedTxs).slice(-2000); 
+                processedTxs.clear();
+                arr.forEach(item => processedTxs.add(item));
+                if(config.DEBUG_MODE) logger.info(`[Cache] تم تنظيف processedTxs من ${oldSize} إلى ${processedTxs.size} (من المعالج)`);
+             }
         }
 
         await sleep(5 * 1000); 
     }
 }
-
 
 // =================================================================
 // 7. الدالة الرئيسية (Main) - [تعديل v15.1]
